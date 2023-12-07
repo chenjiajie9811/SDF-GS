@@ -1,0 +1,66 @@
+# dataset: 'replica'
+
+
+# data:
+#   input_folder: /usr/stud/chj/storage/user/chj/datasets/Replica/room0/
+#   root : "/usr/stud/chj/storage/user/chj/datasets/Replica/room0/"
+#   idx0 : 10
+#   idx1 : 50
+
+
+# cam:
+#   H: 680
+#   W: 1200
+#   fx: 600.0
+#   fy: 600.0
+#   cx: 599.5
+#   cy: 339.5
+#   png_depth_scale: 6553.5
+#   crop_edge: 0
+
+model:
+  sh_degree : 2
+  source_path : "/usr/stud/chj/datasets/lego"
+  model_path : "./output/lego/"
+  images : "images"
+  resolution : -1
+  white_background : False
+  data_device : "cuda"
+  eval : True
+
+  # grid
+  grid_resolution : 128
+  grid_num_block: 16
+  grid_relax_ratio : 1.5
+
+training:
+  iterations : 30_000
+
+  position_lr_init : 0.00016
+  position_lr_final : 0.0000016
+  position_lr_delay_mult : 0.01
+  position_lr_max_steps : 30_000
+  feature_lr : 0.0025
+  opacity_lr : 0.05
+  scaling_lr : 0.005
+  rotation_lr : 0.001
+
+  lambda_dssim : 0.2
+
+  percent_dense : 0.01
+  densification_interval : 100
+  opacity_reset_interval : 3000
+  densify_from_iter : 500
+  densify_until_iter : 5000 #15_000
+  densify_grad_threshold : 0.0002
+
+  bce_from_iter : 500
+  bce_iter_count: 500
+
+  coarse_mesh_iter : 1500
+  coarse_mesh_resolution : 128
+
+pipeline:
+  convert_SHs_python : False
+  compute_cov3D_python : False
+  debug : False
