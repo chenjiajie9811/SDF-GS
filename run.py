@@ -20,6 +20,8 @@ from utils.system_utils import load_config
 
 from train import eval
 
+device = 'cuda'
+
 def read_pc_from_ply(path):
     plydata = PlyData.read(path)
 
@@ -91,10 +93,10 @@ def training(cfg, scene: Scene, saving_iterations):
     scene.gaussians.training_setup_second_stage(cfg_training)
 
     bg_color = [1, 1, 1] if cfg['model']['white_background'] else [0, 0, 0]
-    background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+    background = torch.tensor(bg_color, dtype=torch.float32, device=device)
 
-    iter_start = torch.cuda.Event(enable_timing = True)
-    iter_end = torch.cuda.Event(enable_timing = True)
+    # iter_start = torch.cuda.Event(enable_timing = True)
+    # iter_end = torch.cuda.Event(enable_timing = True)
 
     viewpoint_stack = None
     ema_loss_for_log = 0.0
@@ -104,7 +106,7 @@ def training(cfg, scene: Scene, saving_iterations):
 
     for iteration in range(first_iter, iterations):        
 
-        iter_start.record()
+        # iter_start.record()
 
         scene.gaussians.update_learning_rate(iteration)
 
@@ -121,14 +123,18 @@ def training(cfg, scene: Scene, saving_iterations):
         image, depth, viewspace_point_tensor, visibility_filter, radii = render_pkg["image"], render_pkg["depth"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
         # Loss
-        gt_image = viewpoint_cam.original_image.cuda()
+        gt_image = viewpoint_cam.original_image.to(device)
         Ll1 = l1_loss(image, gt_image)
 
         loss = (1.0 - cfg_training['lambda_dssim']) * Ll1 + cfg_training['lambda_dssim'] * (1.0 - ssim(image, gt_image))
         
         loss.backward(retain_graph=True)
+        # print("after one backward")
+        # print (scene.gaussians.grid.grad.max())
+        # print (scene.gaussians.grid.grad.min())
+        # input()
 
-        iter_end.record()
+        # iter_end.record()
 
         with torch.no_grad():
             # Progress bar
@@ -148,7 +154,7 @@ def training(cfg, scene: Scene, saving_iterations):
             # Optimizer step
             # if iteration < iterations:
             scene.gaussians.optimizer.step()
-            scene.gaussians.optimizer.zero_grad(set_to_none = True)
+            scene.gaussians.optimizer.zero_grad()
 
         # torch.cuda.empty_cache()
 
@@ -170,13 +176,108 @@ def demo_training_stage_2():
     gaussians.init_second_stage(debug_save=False, debug_load=True)
     scene = Scene(cfg['model'], gaussians, load_iteration=None)
 
-    training(cfg, scene, [i for i in range(0, 30000, 30)])
+    training(cfg, scene, [i for i in range(0, 30000, 500)])
 
+def dummy_test_point_rasterization():
+    gaussian_path = './output/lego/point_cloud/iteration_6000/point_cloud.ply'
+    mesh_path = './output/mesh_128_from_iter3000.ply'
+
+    gaussians = GaussianModel(2)
+    gaussians.load_ply(gaussian_path)
+    gaussians.init_second_stage(debug_save=False, debug_load=True)
+    gaussians.training_setup_second_stage(None)
+    
+    for i in range(1000):
+        v, f, n = gaussians.grid2mesh(gaussians.grid)
+        v.requires_grad_(True)
+        v.retain_grad()
+        print ("v.grad", v.grad)
+        v = (v / torch.tensor(gaussians.resolution).float().to(gaussians.device) - 0.5) * 2
+        
+        dummy_v = torch.ones_like(v).requires_grad_(True)
+
+        loss = torch.mean(torch.abs(v - dummy_v))
+
+        loss.backward()
+
+        if i > 0:
+            print ("gaussians grid grad ", i)
+            print (gaussians.grid.grad.min())
+            print (gaussians.grid.grad.max())
+
+        print ("loss: ", loss.item())
+        input()
+        with torch.no_grad():
+            gaussians.optimizer.step()
+            gaussians.optimizer.zero_grad()
+
+
+class QuadraticFunctionAutograd(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, A, b, c):
+        """
+        Compute the value of the quadratic function at point x.
+        """
+        ctx.save_for_backward(x, A, b, c)
+        return 0.5 * x.T @ A @ x + b.T @ x + c
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """
+        Compute the gradient of the quadratic function at point x.
+        """
+        x, A, b, c = ctx.saved_tensors
+        grad_x = A @ x + b
+        return grad_output * grad_x, None, None, None
+
+def test_grad():
+    # Define a quadratic function: f(x) = 0.5 * x^T * A * x + b^T * x + c
+    A = torch.tensor([[2.0]], requires_grad=False)
+    b = torch.tensor([2.0], requires_grad=False)
+    c = torch.tensor(1.0, requires_grad=False)
+
+    # Create an instance of the QuadraticFunctionAutograd class
+    quad_function = QuadraticFunctionAutograd.apply
+
+    # Initialize a point for optimization
+    x_init = torch.tensor([0.0], requires_grad=True)
+
+    # Set up optimization (gradient descent in this case)
+    learning_rate = 0.1
+    optimizer = torch.optim.SGD([x_init], lr=learning_rate)
+
+    # Number of optimization steps
+    num_steps = 100
+
+    # Optimization loop
+    for step in range(num_steps):
+        # Forward pass: compute the value of the quadratic function
+        value = quad_function(x_init, A, b, c)
+
+        # Backward pass: compute the gradient of the quadratic function
+        optimizer.zero_grad()
+        value.backward()  # This will compute gradients for x_init
+        optimizer.step()
+
+        # Print the progress
+        if (step + 1) % 10 == 0:
+            print(f"Step {step + 1}/{num_steps}, Value: {value.item()}, x: {x_init.data.numpy()}")
+
+    # Final optimized parameters
+    print("Final optimized x:", x_init.data.numpy())
 if __name__ == '__main__':
     # import cv2
     # a = cv2.imread('/storage/user/chj/chj/SDF-GS/output/lego/test/iter_3000/renders/00000.png')
     # print (a.max())
+    # test_grad()
+    # input()
+    
+    # testOptim()
+    # input()
+    # dummy_test_point_rasterization()
+    
     demo_training_stage_2()
+
     
     # V, N = read_pc_from_ply('/usr/stud/chj/storage/user/chj/SDF-GS/output/lego/point_cloud/iteration_9000/point_cloud.ply')
     # dpsr = DPSR((64, 64, 64)).cuda()

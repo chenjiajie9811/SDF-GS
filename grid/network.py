@@ -8,7 +8,7 @@ from utils.rigid_utils import exp_so3
 from grid.grid import Grid2Mesh, DenseGrid
 
 class Mesh2GaussiansNetwork(nn.Module):
-    def __init__(self, L=4, D=64, multires=10):
+    def __init__(self, L=8, D=128, multires=10):
         super(Mesh2GaussiansNetwork, self).__init__()
         self.L = L
         self.D = D
@@ -34,21 +34,25 @@ class Mesh2GaussiansNetwork(nn.Module):
 
     def forward(self, vertices, faces, normals):
         vertices_emb = self.embed_fn(vertices) # (B, M, K)
-        print (vertices_emb)
+        # print (vertices_emb)
 
         vec1 = vertices[:, faces[:, :, 0].flatten()] - vertices[:, faces[:, :, 1].flatten()] 
         vec2 = vertices[:, faces[:, :, 0].flatten()] - vertices[:, faces[:, :, 2].flatten()] 
         faces_normal = F.normalize(torch.cross(vec1, vec2, dim=-1))
         # faces_normal = F.normalize((normals[:, faces[:, :, 0].flatten()] + normals[:, faces[:, :, 1].flatten()] + normals[:, faces[:, :, 2].flatten()]) / 3.0, dim=-1) 
         x = torch.cat([vertices_emb[:, faces[:, :, 0].flatten()], vertices_emb[:, faces[:, :, 1].flatten()], vertices_emb[:, faces[:, :, 2].flatten()], faces_normal], dim=-1) 
+        
         h = self.linear[0](x)
+
         h = F.relu(h)
-        for i in range(1, self.D - 1):
+        for i in range(1, self.L):
             h = self.linear[i](h)
             h = F.relu(h)
             if i in self.skips:
                 h = torch.cat([x, h], dim=-1)
-
+            # print ("output at layer: ", i)
+            # print (h.shape)
+        
         bary_coords_2 = torch.sigmoid(self.bary_coords_lin(h))
         bary_coord_last = 1. - torch.sum(bary_coords_2, dim=-1)
 
@@ -70,9 +74,9 @@ class Mesh2GaussiansNetwork(nn.Module):
         # ret['rotation'] = F.normalize(self.rotation_quat_lin(h))
         ret['rgb'] = torch.sigmoid(self.rgb_lin(h))
     
-        print (ret['rgb'])
-        print (ret['opacity'])
-        print (ret['scaling'])
+        # print (ret['rgb'])
+        # print (ret['opacity'])
+        # print (ret['scaling'])
         # ret = {
         #     'xyz' : torch.zeros_like(faces),
         #     'opacity' : torch.zeros((*faces.shape[:2], 1)),
