@@ -156,7 +156,7 @@ def point_rasterize(pts, vals, size):
 
 class Grid2Mesh(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, grid):
+    def forward(ctx, grid, level=0.5):
         """
         In the forward pass we receive a Tensor containing the input and return
         a Tensor containing the output. ctx is a context object that can be used
@@ -165,7 +165,7 @@ class Grid2Mesh(torch.autograd.Function):
         """
 
         grid_numpy = grid.detach().cpu().numpy()
-        verts, faces, normals, values = measure.marching_cubes(grid_numpy, level=0.5)
+        verts, faces, normals, values = measure.marching_cubes(grid_numpy, level=level)
 
         verts /= grid_numpy.shape[-3:] # rescale the vertices from the resolution to [0, 1]
 
@@ -211,7 +211,7 @@ class Grid2Mesh(torch.autograd.Function):
         # print ("min")
         # print (grad_grid.min())
 
-        return grad_grid
+        return grad_grid, None
 
 
 

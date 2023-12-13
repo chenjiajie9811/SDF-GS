@@ -5,7 +5,7 @@ from plyfile import PlyData, PlyElement
 from scipy.spatial.transform import Rotation
 from dpsr import *
 # from grid.grid import *
-
+import trimesh
 from tqdm import tqdm
 from random import randint
 
@@ -265,6 +265,121 @@ def test_grad():
 
     # Final optimized parameters
     print("Final optimized x:", x_init.data.numpy())
+
+def test_hash_grid_network():
+    from grid.network import ImplicitNetworkGrid
+
+    resolution = 128
+    grid_net = ImplicitNetworkGrid(16, True, 3, 1, [128, 128], multires=4, divide_factor=1.0).cuda()
+    X = torch.linspace(-1, 1, resolution)
+    Y = torch.linspace(-1, 1, resolution)
+    Z = torch.linspace(-1, 1, resolution)
+    grid = torch.stack(torch.meshgrid(X, Y, Z, indexing='ij'), dim=-1).view(-1, 3).cuda()
+    print (grid.shape)
+    sdfs = grid_net.get_sdf_vals(grid)
+    print (sdfs.shape)
+
+    grid_numpy = sdfs.view(resolution, resolution, resolution).detach().cpu().numpy()
+    verts, faces, normals, values = measure.marching_cubes(grid_numpy, level=0)
+    
+    _mesh = trimesh.Trimesh(vertices=verts, faces=faces)
+    _mesh.export('./sampled.ply')
+    
+    print ("finished")
+
+def training_pipeline(cfg, scene: Scene, saving_iterations):
+    cfg_training = cfg['training']
+    cfg_model = cfg['model']
+    
+    first_iter = 0
+    # scene.gaussians.training_setup_second_stage(cfg_training)
+
+    bg_color = [1, 1, 1] if cfg['model']['white_background'] else [0, 0, 0]
+    background = torch.tensor(bg_color, dtype=torch.float32, device=device)
+
+    # iter_start = torch.cuda.Event(enable_timing = True)
+    # iter_end = torch.cuda.Event(enable_timing = True)
+
+    viewpoint_stack = None
+    ema_loss_for_log = 0.0
+    iterations = cfg_training['iterations']
+    progress_bar = tqdm(range(first_iter, iterations), desc="Training progress")
+    first_iter += 1
+
+    for iteration in range(first_iter, iterations):        
+
+        # iter_start.record()
+
+        scene.gaussians.update_learning_rate(iteration)
+
+        # Pick a random Camera
+        if not viewpoint_stack:
+            viewpoint_stack = scene.getTrainCameras().copy()
+        viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
+
+        # Update one iteration
+        scene.gaussians.run_pipeline()
+        
+        # Render
+        render_pkg = render(viewpoint_cam, scene.gaussians, cfg['pipeline'], background)
+        image, depth, viewspace_point_tensor, visibility_filter, radii = render_pkg["image"], render_pkg["depth"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+
+        # Loss
+        gt_image = viewpoint_cam.original_image.to(device)
+        Ll1 = l1_loss(image, gt_image)
+
+        loss = (1.0 - cfg_training['lambda_dssim']) * Ll1 + cfg_training['lambda_dssim'] * (1.0 - ssim(image, gt_image))
+        
+        loss.backward(retain_graph=True)
+        # print("after one backward")
+        # print (scene.gaussians.grid.grad.max())
+        # print (scene.gaussians.grid.grad.min())
+        # input()
+
+        # iter_end.record()
+
+        with torch.no_grad():
+            # Progress bar
+            ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
+            if iteration % 10 == 0:
+                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
+                progress_bar.update(10)
+            if iteration == iterations:
+                progress_bar.close()
+            
+            # Log and save
+            if (iteration in saving_iterations):
+                eval(scene, cfg_model, iteration, cfg['pipeline'], background, skip_train=False, skip_test=False)
+                print("\n[ITER {}] Saving Gaussians".format(iteration))
+                scene.save(iteration)
+
+            # Optimizer step
+            # if iteration < iterations:
+            scene.gaussians.optimizer.step()
+            scene.gaussians.optimizer.zero_grad()
+
+        # torch.cuda.empty_cache()
+
+def test_gaussian_network_pipeline():
+    cfg = load_config('./configs/default.yaml')
+
+    safe_state(False)
+    torch.autograd.set_detect_anomaly(False)
+
+    gaussians = GaussianModel(1)
+    gaussians.init_pipeline()
+    # gaussians.run_pipeline()
+    # input()
+
+    scene = Scene(cfg['model'], gaussians, load_iteration=None)
+
+    training_pipeline(cfg, scene, [i for i in range(0, 30000, 2000)])
+    save_points_ply(gaussians.get_xyz, './sampled.ply')
+    print ("finished")
+
+
+
+
 if __name__ == '__main__':
     # import cv2
     # a = cv2.imread('/storage/user/chj/chj/SDF-GS/output/lego/test/iter_3000/renders/00000.png')
@@ -275,8 +390,11 @@ if __name__ == '__main__':
     # testOptim()
     # input()
     # dummy_test_point_rasterization()
+
+    test_gaussian_network_pipeline()
+    input()
     
-    demo_training_stage_2()
+    # demo_training_stage_2()
 
     
     # V, N = read_pc_from_ply('/usr/stud/chj/storage/user/chj/SDF-GS/output/lego/point_cloud/iteration_9000/point_cloud.ply')

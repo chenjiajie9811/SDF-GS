@@ -18,7 +18,7 @@ from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotati
 from utils.rigid_utils import matrix_to_quaternion
 
 from grid.grid import DenseGrid, Grid2Mesh
-from grid.network import Mesh2GaussiansNetwork
+from grid.network import Mesh2GaussiansNetwork, GaussianNetwork
 
 from skimage import measure
 from scipy.spatial.transform import Rotation as R
@@ -762,6 +762,46 @@ class GaussianModel:
         # print (self.get_opacity.shape)
         # print (self.get_features.shape)
         # print (self.grid.shape)
+
+    def init_pipeline(self, resolution=64):
+        self.gaussian_net = GaussianNetwork()
+        X = torch.linspace(-1, 1, resolution)
+        Y = torch.linspace(-1, 1, resolution)
+        Z = torch.linspace(-1, 1, resolution)
+        self.grid_coordinate = torch.stack(torch.meshgrid(X, Y, Z, indexing='ij'), dim=-1).view(-1, 3).cuda()
+
+        l = [
+                {'params': list(self.gaussian_net.parameters()), 'lr': 2e-4, "name": "net"}
+            ]
+
+        self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
+
+    def run_pipeline(self):
+        gaussians = self.gaussian_net(self.grid_coordinate)
+        
+        self._xyz = gaussians['xyz'].squeeze(0)
+        features = torch.zeros((self._xyz.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().to(self.device)
+        features[:, :3, 0 ] = RGB2SH(gaussians['rgb'].squeeze(0))
+        features[:, 3:, 1:] = 0.0
+        self._features_dc = features[:,:,0:1].transpose(1, 2).contiguous()
+        self._features_rest = features[:,:,1:].transpose(1, 2).contiguous()
+        self._features_dc.retain_grad()
+        self._features_rest.retain_grad()
+
+        self._scaling = self.scaling_inverse_activation(0.1*gaussians['scaling'].squeeze(0))
+ 
+        self._rotation = matrix_to_quaternion(gaussians['rotation_matrix'].squeeze(0))
+ 
+        self._opacity = self.inverse_opacity_activation(gaussians['opacity'].squeeze(0))
+
+        # print (self.get_xyz.shape)
+        # print (self.get_scaling.shape)
+        # print (self.get_rotation.shape)
+        # print (self.get_opacity.shape)
+        # print (self.get_features.shape)
+
+
+
 
 
 
