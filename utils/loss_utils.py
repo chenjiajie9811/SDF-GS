@@ -65,3 +65,6 @@ def _ssim(img1, img2, window, window_size, channel, size_average=True):
 def sparse_loss(a):
     return torch.mean(torch.log(a) + torch.log(1 - a))
 
+def eikonal_loss(grad):
+    return ((grad.norm(2, dim=-1) - 1) ** 2).mean()
+

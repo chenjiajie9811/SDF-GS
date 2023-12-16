@@ -9,6 +9,7 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+import torch
 from scene.cameras import Camera
 import numpy as np
 from utils.general_utils import PILtoTorch
@@ -80,3 +81,14 @@ def camera_to_JSON(id, camera : Camera):
         'fx' : fov2focal(camera.FovX, camera.width)
     }
     return camera_entry
+
+def get_camera_center(camera : Camera):
+    Rt = np.zeros((4, 4))
+    Rt[:3, :3] = camera.R.transpose()
+    Rt[:3, 3] = camera.T
+    Rt[3, 3] = 1.0
+
+    W2C = np.linalg.inv(Rt)
+    pos = W2C[:3, 3]
+    rot = W2C[:3, :3]
+    return torch.tensor(pos)

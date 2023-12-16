@@ -763,21 +763,35 @@ class GaussianModel:
         # print (self.get_features.shape)
         # print (self.grid.shape)
 
-    def init_pipeline(self, resolution=64):
-        self.gaussian_net = GaussianNetwork()
-        X = torch.linspace(-1, 1, resolution)
-        Y = torch.linspace(-1, 1, resolution)
-        Z = torch.linspace(-1, 1, resolution)
-        self.grid_coordinate = torch.stack(torch.meshgrid(X, Y, Z, indexing='ij'), dim=-1).view(-1, 3).cuda()
+    def init_pipeline(self, resolution=128, use_flexicubes=False):
+        self.use_flexicubs = use_flexicubes
+        if not use_flexicubes:
+            X = torch.linspace(-1, 1, resolution)
+            Y = torch.linspace(-1, 1, resolution)
+            Z = torch.linspace(-1, 1, resolution)
+            self.grid_coordinate = torch.stack(torch.meshgrid(X, Y, Z, indexing='ij'), dim=-1).view(-1, 3).cuda()
+            self.gaussian_net = GaussianNetwork()
+        else:
+            from flexicubes.flexicubes import FlexiCubes
+            self.fc = FlexiCubes()
+            self.grid_coordinate, self.cube_fx8 = self.fc.construct_voxel_grid(resolution)
+            self.grid_coordinate *= 2
+            fc_cube_weights_ = torch.zeros((self.cube_fx8.shape[0], 21), dtype=torch.float, device=self.device)
+            self.fc_cube_weights = torch.nn.Parameter(fc_cube_weights_.clone().detach(), requires_grad=True)
 
+            self.gaussian_net = GaussianNetwork(self.fc, self.fc_cube_weights, resolution, self.device)
         l = [
-                {'params': list(self.gaussian_net.parameters()), 'lr': 2e-4, "name": "net"}
+                {'params': list(self.gaussian_net.parameters()), 'lr': 2e-4, "name": "net"},
+                # {'params': self.fc_cube_weights, 'lr': 2e-4, "name": "fc_weights"}
             ]
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
 
-    def run_pipeline(self):
-        gaussians = self.gaussian_net(self.grid_coordinate)
+    def run_pipeline(self, cam_pos):
+        if self.use_flexicubs:
+            gaussians, v, f, l, grad = self.gaussian_net(self.grid_coordinate, cam_pos, self.cube_fx8)
+        else:
+            gaussians, v, f, n, grad = self.gaussian_net(self.grid_coordinate, cam_pos)
         
         self._xyz = gaussians['xyz'].squeeze(0)
         features = torch.zeros((self._xyz.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().to(self.device)
@@ -799,7 +813,11 @@ class GaussianModel:
         # print (self.get_rotation.shape)
         # print (self.get_opacity.shape)
         # print (self.get_features.shape)
-
+        
+        if self.use_flexicubs:
+            return v.clone().detach().cpu().numpy(), f.clone().detach().cpu().numpy(), l, grad
+        else:
+            return v.clone().detach().cpu().numpy(), f.clone().detach().cpu().numpy(), n.clone().detach().cpu().numpy(), grad
 
 
 
