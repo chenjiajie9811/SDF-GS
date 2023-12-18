@@ -326,12 +326,18 @@ class GaussianModel:
                                                     lr_final=training_args['position_lr_final']*self.spatial_lr_scale,
                                                     lr_delay_mult=training_args['position_lr_delay_mult'],
                                                     max_steps=training_args['position_lr_max_steps'])
+        
+        
 
     def update_learning_rate(self, iteration):
         ''' Learning rate scheduling per step '''
         for param_group in self.optimizer.param_groups:
             if param_group["name"] == "xyz":
                 lr = self.xyz_scheduler_args(iteration)
+                param_group['lr'] = lr
+                return lr
+            if param_group["name"] == 'net':
+                lr = self.gaussian_net_lr_scheduler(iteration)
                 param_group['lr'] = lr
                 return lr
 
@@ -780,18 +786,23 @@ class GaussianModel:
             self.fc_cube_weights = torch.nn.Parameter(fc_cube_weights_.clone().detach(), requires_grad=True)
 
             self.gaussian_net = GaussianNetwork(self.fc, self.fc_cube_weights, resolution, self.device)
+        
         l = [
                 {'params': list(self.gaussian_net.parameters()), 'lr': 2e-4, "name": "net"},
                 # {'params': self.fc_cube_weights, 'lr': 2e-4, "name": "fc_weights"}
             ]
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
+        self.gaussian_net_lr_scheduler = get_expon_lr_func(lr_init=5e-4,
+                                                    lr_final=1e-5,
+                                                    lr_delay_mult=0.01,
+                                                    max_steps=30_000)
 
     def run_pipeline(self, cam_pos):
         if self.use_flexicubs:
-            gaussians, v, f, l, grad = self.gaussian_net(self.grid_coordinate, cam_pos, self.cube_fx8)
+            gaussians, ret = self.gaussian_net(self.grid_coordinate, cam_pos, self.cube_fx8)
         else:
-            gaussians, v, f, n, grad = self.gaussian_net(self.grid_coordinate, cam_pos)
+            gaussians, ret = self.gaussian_net(self.grid_coordinate, cam_pos)
         
         self._xyz = gaussians['xyz'].squeeze(0)
         features = torch.zeros((self._xyz.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().to(self.device)
@@ -802,7 +813,7 @@ class GaussianModel:
         self._features_dc.retain_grad()
         self._features_rest.retain_grad()
 
-        self._scaling = self.scaling_inverse_activation(0.1*gaussians['scaling'].squeeze(0))
+        self._scaling = self.scaling_inverse_activation(gaussians['scaling'].squeeze(0))
  
         self._rotation = matrix_to_quaternion(gaussians['rotation_matrix'].squeeze(0))
  
@@ -814,11 +825,11 @@ class GaussianModel:
         # print (self.get_opacity.shape)
         # print (self.get_features.shape)
         
-        if self.use_flexicubs:
-            return v.clone().detach().cpu().numpy(), f.clone().detach().cpu().numpy(), l, grad
-        else:
-            return v.clone().detach().cpu().numpy(), f.clone().detach().cpu().numpy(), n.clone().detach().cpu().numpy(), grad
-
+        # if self.use_flexicubs:
+        #     return v.clone().detach().cpu().numpy(), f.clone().detach().cpu().numpy(), l, grad
+        # else:
+        #     return v.clone().detach().cpu().numpy(), f.clone().detach().cpu().numpy(), n.clone().detach().cpu().numpy(), grad
+        return ret
 
 
 

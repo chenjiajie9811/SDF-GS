@@ -151,10 +151,10 @@ class ImplicitNetworkGrid(nn.Module):
             multires=0,
             sphere_scale=1.0,
             inside_outside=False,
-            base_size = 8, #16,
-            end_size = 1024,#2048,
-            logmap = 16,#19,
-            num_levels=8,#16,
+            base_size = 16, #16,
+            end_size = 2048,#2048,
+            logmap = 19,#19,
+            num_levels=16,#16,
             level_dim=2,
             divide_factor = 1.5, # used to normalize the points range for multi-res grid
             use_grid_feature = True
@@ -242,8 +242,8 @@ class ImplicitNetworkGrid(nn.Module):
 
     def get_encoding(self, input):
         feature = self.encoding(input / self.divide_factor)
-        # embed = self.embed_fn(input)
-        encoded = torch.cat((input, feature), dim=-1)
+        embed = self.embed_fn(input)
+        encoded = torch.cat((embed, feature), dim=-1)
         return encoded
 
     def forward(self, input):
@@ -371,8 +371,8 @@ class Mesh2GaussiansNetwork(nn.Module):
         ret = dict()
 
         ret['xyz'] =  vertices[:, faces[:, :, 0].flatten()] * bary_coords_2[:, :, 0].reshape(-1, 1).unsqueeze(0) + \
-                                    vertices[:, faces[:, :, 0].flatten()] * bary_coords_2[:, :, 1].reshape(-1, 1).unsqueeze(0) + \
-                                    vertices[:, faces[:, :, 0].flatten()] * bary_coord_last.reshape(-1, 1).unsqueeze(0)
+                    vertices[:, faces[:, :, 1].flatten()] * bary_coords_2[:, :, 1].reshape(-1, 1).unsqueeze(0) + \
+                    vertices[:, faces[:, :, 2].flatten()] * bary_coord_last.reshape(-1, 1).unsqueeze(0)
         
         ret['opacity'] = torch.sigmoid(self.opacity_lin(h))
 
@@ -386,12 +386,12 @@ class Mesh2GaussiansNetwork(nn.Module):
         return ret
     
 class GaussianGeoNetwork(nn.Module):
-    def __init__(self, D=64, num_geo_feat=16, num_hash_feat=16, device='cuda'):
+    def __init__(self, D=64, num_geo_feat=16, num_hash_feat=32, num_sdf_feat=16, multires_geo=6, device='cuda'):
         super(GaussianGeoNetwork, self).__init__()
 
         self.device = device
-        # self.view_embed_fn, geo_input_ch = get_embedder(multires_geo, 3)
-        self.input_ch = 3 * (3 + num_hash_feat) + 3 # (3 embedded vertices + 3 normals)
+        self.view_embed_fn, geo_input_ch = get_embedder(multires_geo, 3)
+        self.input_ch = 3 * (geo_input_ch + num_hash_feat + num_sdf_feat) + 3 # (3 embedded vertices + 3 normals)
 
         self.linear = nn.ModuleList(
             [
@@ -400,7 +400,7 @@ class GaussianGeoNetwork(nn.Module):
             ]
         )
 
-        self.bary_coords_lin = nn.Linear(D, 2)
+        self.bary_coords_lin = nn.Linear(D, 3)
         self.opacity_lin = nn.Linear(D, 1)
         self.scaling_lin = nn.Linear(D, 3)
         self.rotation_angle_lin = nn.Linear(D, 1)
@@ -410,7 +410,7 @@ class GaussianGeoNetwork(nn.Module):
         vec1 = vertices[:, faces[:, :, 0].flatten()] - vertices[:, faces[:, :, 1].flatten()] 
         vec2 = vertices[:, faces[:, :, 0].flatten()] - vertices[:, faces[:, :, 2].flatten()] 
         cross_pro = torch.cross(vec1, vec2, dim=-1)
-        base_scale = torch.sqrt(cross_pro.norm() / torch.pi)
+        # base_scale = torch.sqrt(cross_pro.norm() / torch.pi)
         faces_normal = F.normalize(cross_pro)
         # faces_normal = F.normalize(torch.cross(vec1, vec2, dim=-1))
         x = torch.cat([embeded[:, faces[:, :, 0].flatten()], embeded[:, faces[:, :, 1].flatten()], embeded[:, faces[:, :, 2].flatten()], faces_normal], dim=-1) 
@@ -419,35 +419,35 @@ class GaussianGeoNetwork(nn.Module):
             x = l(x)
             x = F.relu(x)
 
-        bary_coords_2 = torch.sigmoid(self.bary_coords_lin(x))
-        bary_coord_last = 1. - torch.sum(bary_coords_2, dim=-1)
+        bary_coords = torch.sigmoid(self.bary_coords_lin(x))
+        bary_coords = bary_coords / torch.sum(bary_coords, dim=-1, keepdim=True)
 
-        ret = dict()
+        gaussians = dict()
 
-        ret['xyz'] =  vertices[:, faces[:, :, 0].flatten()] * bary_coords_2[:, :, 0].reshape(-1, 1).unsqueeze(0) + \
-                                    vertices[:, faces[:, :, 0].flatten()] * bary_coords_2[:, :, 1].reshape(-1, 1).unsqueeze(0) + \
-                                    vertices[:, faces[:, :, 0].flatten()] * bary_coord_last.reshape(-1, 1).unsqueeze(0)
+        gaussians['xyz'] =  vertices[:, faces[:, :, 0].flatten()] * bary_coords[:, :, 0].reshape(-1, 1).unsqueeze(0) + \
+                        vertices[:, faces[:, :, 0].flatten()] * bary_coords[:, :, 1].reshape(-1, 1).unsqueeze(0) + \
+                        vertices[:, faces[:, :, 0].flatten()] * bary_coords[:, :, 2].reshape(-1, 1).unsqueeze(0)
         
         # geo_feat = self.opacity_lin(x)
-        ret['opacity'] = torch.sigmoid(self.opacity_lin(x))
+        gaussians['opacity'] = torch.sigmoid(self.opacity_lin(x))
 
-        ret['scaling']= torch.sigmoid(self.scaling_lin(x)) * base_scale# need the base scaling
+        gaussians['scaling']= torch.sigmoid(self.scaling_lin(x)) * (2. / 100) #* base_scale# need the base scaling
         rotation_theta = torch.sigmoid(self.rotation_angle_lin(x)) * 2 * torch.pi
         
-        ret['rotation_matrix'] = exp_so3(faces_normal.squeeze(0), rotation_theta.squeeze(0)).unsqueeze(0)
+        gaussians['rotation_matrix'] = exp_so3(faces_normal.squeeze(0), rotation_theta.squeeze(0)).unsqueeze(0)
 
         geo_feat = F.relu(self.geo_feat_lin(x))
 
-        return ret, geo_feat
+        return gaussians, geo_feat
         
 
 class GaussianRGBNetwork(nn.Module):
-    def __init__(self, D=64, num_geo_feat=16, num_hash_feat=16, multires_view=6, device='cuda'):
+    def __init__(self, D=64, num_geo_feat=16, num_hash_feat=32, multires_view=6, device='cuda'):
         super(GaussianRGBNetwork, self).__init__()
 
         self.device = device
         self.view_embed_fn, view_ch = get_embedder(multires_view, 3)
-        self.input_ch = (3 + num_hash_feat) + view_ch + num_geo_feat
+        self.input_ch = (view_ch + num_hash_feat) + view_ch + num_geo_feat
 
         self.linear = nn.ModuleList(
             [
@@ -519,7 +519,7 @@ class GaussianNetwork(nn.Module):
         self.device = device
         self.res = resolution
         self.multires = 6
-        self.sdf_grid_net = ImplicitNetworkGrid(1, True, 3, 1, [64, 64], multires=self.multires, divide_factor=1.0).to(self.device)
+        self.sdf_grid_net = ImplicitNetworkGrid(15, True, 3, 1, [64, 64], multires=self.multires, divide_factor=1.0).to(self.device)
         self.use_flexicubs = False
         if fc is not None:
             self.use_flexicubs = True
@@ -527,8 +527,8 @@ class GaussianNetwork(nn.Module):
             self.fc_weights = fc_weights
         else:
             self.mesh_from_grid = Grid2Mesh.apply
-        self.gaussian_geo_from_mesh = GaussianGeoNetwork(D=64, num_geo_feat=16, num_hash_feat=16).to(self.device)
-        self.gaussian_rgb_from_mesh = GaussianRGBNetwork(D=64, num_geo_feat=16, num_hash_feat=16, multires_view=6).to(self.device)
+        self.gaussian_geo_from_mesh = GaussianGeoNetwork(D=64, num_geo_feat=16, num_hash_feat=32, num_sdf_feat=16, multires_geo=6).to(self.device)
+        self.gaussian_rgb_from_mesh = GaussianRGBNetwork(D=64, num_geo_feat=16, num_hash_feat=32, multires_view=6).to(self.device)
         # self.gaussians_from_mesh = Mesh2GaussiansNetwork(multires=self.multires).to(self.device)
 
     def forward(self, input, cam_pose, cube_fx8=None):
@@ -546,23 +546,33 @@ class GaussianNetwork(nn.Module):
         f = f.long()
 
         v_encoded = self.sdf_grid_net.get_encoding(v) #(V, hash_feat + 3)
+        v_sdf, v_feat, v_grad = self.sdf_grid_net.get_outputs(v)
+        v_encoded = torch.cat([v_encoded, v_sdf, v_feat], dim=-1)
 
         # geo_feat : (G, geo_feat_num)
         # gaussian_xyz: (G, 3)
         gaussians, geo_feat = self.gaussian_geo_from_mesh(v_encoded.unsqueeze(0), v.unsqueeze(0), f.unsqueeze(0))
 
         gaussians_center_encoded = self.sdf_grid_net.get_encoding(gaussians['xyz']) # (G, hash_feat + 3)
-        sdf_gauss, _, grad_gauss = self.sdf_grid_net.get_outputs(gaussians['xyz'])
+        # sdf_gauss, _, grad_gauss = self.sdf_grid_net.get_outputs(gaussians['xyz'])
 
-        grad = torch.cat([grad_grid, grad_gauss.squeeze(0)], dim=-2)
+        grad = torch.cat([grad_grid, v_grad.squeeze(0)], dim=-2)
         
         view_dirs = F.normalize(cam_pose.unsqueeze(0) - gaussians['xyz']) # (G, 3)
         gaussians['rgb'] = self.gaussian_rgb_from_mesh(gaussians_center_encoded, geo_feat, view_dirs)
 
+        ret = {
+            'v' : v,
+            'f' : f,
+            'grad' : grad
+        }
+
         if self.use_flexicubs:
-            return gaussians, v, f, l, grad
+            ret['l'] = l
+            return gaussians, ret
         else:
-            return gaussians, v, f, n, grad
+            ret['n'] = n
+            return gaussians, ret
 
 
 

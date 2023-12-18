@@ -320,7 +320,7 @@ def training_pipeline(cfg, scene: Scene, saving_iterations):
         cam_pos = get_camera_center(viewpoint_cam).reshape(-1, 3).cuda().float()
 
         # Update one iteration
-        v, f, l, grad = scene.gaussians.run_pipeline(cam_pos)
+        ret = scene.gaussians.run_pipeline(cam_pos)
         
         # Render
         render_pkg = render(viewpoint_cam, scene.gaussians, cfg['pipeline'], background)
@@ -331,9 +331,9 @@ def training_pipeline(cfg, scene: Scene, saving_iterations):
         Ll1 = l1_loss(image, gt_image)
 
         loss = (1.0 - cfg_training['lambda_dssim']) * Ll1 + cfg_training['lambda_dssim'] * (1.0 - ssim(image, gt_image))
-        loss += 0.1 * eikonal_loss(grad)
+        loss += 0.1 * eikonal_loss(ret['grad'])
         if scene.gaussians.use_flexicubs:
-            loss += l.mean() * 0.5
+            loss += ret['l'].mean() * 0.5
             loss += (scene.gaussians.fc_cube_weights[:, :20]).abs().mean() * 0.1
         
         loss.backward(retain_graph=True)
@@ -358,7 +358,7 @@ def training_pipeline(cfg, scene: Scene, saving_iterations):
                 eval(scene, cfg_model, iteration, cfg['pipeline'], background, skip_train=False, skip_test=False)
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
-                mesh_ = trimesh.Trimesh(vertices=v, faces=f)
+                mesh_ = trimesh.Trimesh(vertices=ret['v'].clone().detach().cpu().numpy(), faces=ret['f'].clone().detach().cpu().numpy())
                 mesh_.export(os.path.join(cfg_model['model_path'], "mesh/iteration{}.ply".format(iteration)))
 
             # Optimizer step
