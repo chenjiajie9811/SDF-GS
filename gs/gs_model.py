@@ -336,10 +336,15 @@ class GaussianModel:
                 lr = self.xyz_scheduler_args(iteration)
                 param_group['lr'] = lr
                 return lr
-            if param_group["name"] == 'net':
-                lr = self.gaussian_net_lr_scheduler(iteration)
+            if param_group["name"] == 'sdf_net':
+                lr = self.sdf_net_lr_scheduler(iteration)
                 param_group['lr'] = lr
-                return lr
+            if param_group["name"] == 'gauss_geo_net':
+                lr = self.gauss_geo_net_lr_scheduler(iteration)
+                param_group['lr'] = lr
+            if param_group["name"] == 'gauss_rgb_net':
+                lr = self.gauss_rgb_net_lr_scheduler(iteration)
+                param_group['lr'] = lr
 
     def construct_list_of_attributes(self):
         l = ['x', 'y', 'z', 'nx', 'ny', 'nz']
@@ -788,13 +793,25 @@ class GaussianModel:
             self.gaussian_net = GaussianNetwork(self.fc, self.fc_cube_weights, resolution, self.device)
         
         l = [
-                {'params': list(self.gaussian_net.parameters()), 'lr': 2e-4, "name": "net"},
+                {'params': list(self.gaussian_net.sdf_grid_net.parameters()), 'lr': 5e-4, "name": "sdf_net"},
+                {'params': list(self.gaussian_net.gaussian_geo_from_mesh.parameters()), 'lr': 1e-4, "name": "gauss_geo_net"},
+                {'params': list(self.gaussian_net.gaussian_rgb_from_mesh.parameters()), 'lr': 2e-4, "name": "gauss_rgb_net"},
                 # {'params': self.fc_cube_weights, 'lr': 2e-4, "name": "fc_weights"}
             ]
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
-        self.gaussian_net_lr_scheduler = get_expon_lr_func(lr_init=5e-4,
-                                                    lr_final=1e-5,
+        self.sdf_net_lr_scheduler = get_expon_lr_func(lr_init=5e-4,
+                                                    lr_final=3e-6,
+                                                    lr_delay_mult=0.01,
+                                                    max_steps=30_000)
+        
+        self.gauss_geo_net_lr_scheduler = get_expon_lr_func(lr_init=1e-4,
+                                                    lr_final=1e-6,
+                                                    lr_delay_mult=0.01,
+                                                    max_steps=30_000)
+        
+        self.gauss_rgb_net_lr_scheduler = get_expon_lr_func(lr_init=2e-4,
+                                                    lr_final=1e-6,
                                                     lr_delay_mult=0.01,
                                                     max_steps=30_000)
 
