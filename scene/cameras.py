@@ -11,8 +11,10 @@
 
 import torch
 from torch import nn
+import random
 import numpy as np
-from utils.graphics_utils import getWorld2View2, getProjectionMatrix
+from utils.graphics_utils import getWorld2View2, getProjectionMatrix, fov2focal
+from utils.pixel_sample_utils import get_samples_with_pixel_grad_and_random, get_all_rays
 
 class Camera(nn.Module):
     def __init__(self, colmap_id, R, T, FoVx, FoVy, image, gt_alpha_mask,
@@ -28,6 +30,7 @@ class Camera(nn.Module):
         self.FoVx = FoVx
         self.FoVy = FoVy
         self.image_name = image_name
+        self.mask = gt_alpha_mask
 
         try:
             self.data_device = torch.device(data_device)
@@ -55,6 +58,25 @@ class Camera(nn.Module):
         self.projection_matrix = getProjectionMatrix(znear=self.znear, zfar=self.zfar, fovX=self.FoVx, fovY=self.FoVy).transpose(0,1).cuda()
         self.full_proj_transform = (self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))).squeeze(0)
         self.camera_center = self.world_view_transform.inverse()[3, :3]
+
+    def generate_rays(self, num_samples, ratio_random=0.5):
+        fx = fov2focal(self.FoVx, self.image_width)
+        fy = fov2focal(self.FoVy, self.image_height)
+        cx = self.image_width / 2
+        cy = self.image_height / 2
+
+        rays_o, rays_d, indices = get_samples_with_pixel_grad_and_random(
+            int(num_samples * (1 - ratio_random)), int(num_samples * ratio_random), fx, fy, cx, cy, self.world_view_transform, self.original_image, self.mask)
+
+        return rays_o, rays_d
+
+    def generate_all_rays(self):
+        fx = fov2focal(self.FoVx, self.image_width)
+        fy = fov2focal(self.FoVy, self.image_height)
+        cx = self.image_width / 2
+        cy = self.image_height / 2
+
+        return get_all_rays(self.image_height, self.image_width, fx, fy, cx, cy, self.world_view_transform)
 
 class MiniCam:
     def __init__(self, width, height, fovy, fovx, znear, zfar, world_view_transform, full_proj_transform):

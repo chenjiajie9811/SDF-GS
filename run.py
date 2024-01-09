@@ -10,6 +10,9 @@ import trimesh
 from tqdm import tqdm
 from random import randint
 
+from nerf.ray_sampler import NeuSRenderer, SingleVarianceNetwork, near_far_from_sphere
+from grid.network import ImplicitNetworkGrid
+
 from gs.gs_renderer import render
 from gs.gs_scene import Scene
 from gs.gs_model import GaussianModel
@@ -375,7 +378,7 @@ def test_gaussian_network_pipeline():
     torch.autograd.set_detect_anomaly(False)
 
     gaussians = GaussianModel(0)
-    gaussians.init_pipeline(resolution=100, use_flexicubes=True)
+    gaussians.init_pipeline(resolution=128, use_flexicubes=True)
     # gaussians.run_pipeline(torch.zeros(1, 3).cuda())
     # input()
 
@@ -385,21 +388,68 @@ def test_gaussian_network_pipeline():
     save_points_ply(gaussians.get_xyz, './sampled.ply')
     print ("finished")
 
-def test_flexicubes():
-    from flexicubes.flexicubes import FlexiCubes
-    # density_fields = torch.load('./density_field.pt')
-    # print (density_fields.shape)
-    fc = FlexiCubes()
-    x_nx3, cube_fx8 = fc.construct_voxel_grid(64)
-    x_nx3 *= 2
+def test_depth_rendering():
+    cfg = load_config('./configs/default.yaml')
 
-    sdf = torch.rand_like(x_nx3[:,0]) - 0.1 # randomly init SDF
-    weight = torch.zeros((cube_fx8.shape[0], 21), dtype=torch.float, device='cuda')
-    vertices, faces, L_dev = fc(x_nx3, sdf, cube_fx8, 64, beta_fx12=weight[:,:12], alpha_fx8=weight[:,12:20],
-            gamma_f=weight[:,20], training=False)
+    safe_state(False)
+    torch.autograd.set_detect_anomaly(False)
+
+    gaussians = GaussianModel(0)
+    # gaussians.init_pipeline(resolution=128, use_flexicubes=True)
+    sdf_network = ImplicitNetworkGrid(15, True, 3, 1, [64, 64], geometric_init=True, multires=6, divide_factor=1.0).to(device)
+    deviation_network = SingleVarianceNetwork(0.3).to(device)
+    neus_renderer = NeuSRenderer(sdf_network, deviation_network, 64, 64, 4, True).to(device)
     
-    mesh = trimesh.Trimesh(vertices=vertices, faces=faces)
-    mesh.export('./sampled.ply')
+    scene = Scene(cfg['model'], gaussians, load_iteration=None)
+
+    viewpoint_stack = None
+    ema_loss_for_log = 0.0
+
+    for iteration in range(0, 10):        
+        # scene.gaussians.update_learning_rate(iteration)
+
+        # Pick a random Camera
+        if not viewpoint_stack:
+            viewpoint_stack = scene.getTrainCameras().copy()
+        viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
+
+        cam_pos = viewpoint_cam.camera_center
+        mask = viewpoint_cam.mask
+
+        rays_o, rays_d = viewpoint_cam.generate_rays(2000)
+        rays_o, rays_d = rays_o.cuda(), rays_d.cuda()
+
+        near, far = near_far_from_sphere(rays_o, rays_d)
+
+        print ("rays_o.shape", rays_o.shape)
+
+        ret = neus_renderer(rays_o, rays_d, near, far)
+
+        print (ret['depths'].shape)
+
+
+        
+        input()
+
+
+# def test_flexicubes():
+#     from flexicubes.flexicubes import FlexiCubes
+#     # density_fields = torch.load('./density_field.pt')
+#     # print (density_fields.shape)
+#     fc = FlexiCubes()
+#     x_nx3, cube_fx8 = fc.construct_voxel_grid(64)
+#     # print (x_nx3.shape)
+#     # print (x_nx3.shape)
+#     # print (cube_fx8)
+#     x_nx3 *= 2
+
+#     sdf = torch.rand_like(x_nx3[:,0]) - 0.1 # randomly init SDF
+#     weight = torch.zeros((cube_fx8.shape[0], 21), dtype=torch.float, device='cuda')
+#     vertices, faces, L_dev = fc(x_nx3, sdf, cube_fx8, 64, beta_fx12=weight[:,:12], alpha_fx8=weight[:,12:20],
+#             gamma_f=weight[:,20], training=False)
+    
+#     # mesh = trimesh.Trimesh(vertices=vertices, faces=faces)
+#     # mesh.export('./sampled.ply')
 
 
 
@@ -415,7 +465,9 @@ if __name__ == '__main__':
     # testOptim()
     # input()
     # dummy_test_point_rasterization()
-    # test_flexicubes
+    # test_flexicubes()
+    test_depth_rendering()
+    input()
     test_gaussian_network_pipeline()
     input()
     

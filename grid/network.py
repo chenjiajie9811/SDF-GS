@@ -519,7 +519,7 @@ class GaussianNetwork(nn.Module):
         self.device = device
         self.res = resolution
         self.multires = 6
-        self.sdf_grid_net = ImplicitNetworkGrid(15, True, 3, 1, [64, 64], multires=self.multires, divide_factor=1.0).to(self.device)
+        self.sdf_grid_net = ImplicitNetworkGrid(15, True, 3, 1, [64, 64], geometric_init=True, multires=self.multires, divide_factor=1.0).to(self.device)
         self.use_flexicubs = False
         if fc is not None:
             self.use_flexicubs = True
