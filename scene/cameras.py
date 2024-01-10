@@ -65,18 +65,20 @@ class Camera(nn.Module):
         cx = self.image_width / 2
         cy = self.image_height / 2
 
+        # print ("self.world_view_transform", self.world_view_transform.permute(1, 0).inverse())
+
         rays_o, rays_d, indices = get_samples_with_pixel_grad_and_random(
-            int(num_samples * (1 - ratio_random)), int(num_samples * ratio_random), fx, fy, cx, cy, self.world_view_transform, self.original_image, self.mask)
+            int(num_samples * (1 - ratio_random)), int(num_samples * ratio_random), fx, fy, cx, cy, self.world_view_transform.permute(1, 0).inverse(), self.original_image, self.mask)
 
         return rays_o, rays_d
 
-    def generate_all_rays(self):
+    def generate_all_rays(self, crop_edge, down_scale):
         fx = fov2focal(self.FoVx, self.image_width)
         fy = fov2focal(self.FoVy, self.image_height)
         cx = self.image_width / 2
         cy = self.image_height / 2
 
-        return get_all_rays(self.image_height, self.image_width, fx, fy, cx, cy, self.world_view_transform)
+        return get_all_rays(self.image_height, self.image_width, fx, fy, cx, cy, self.world_view_transform, crop_edge=crop_edge, down_scale=down_scale)
 
 class MiniCam:
     def __init__(self, width, height, fovy, fovx, znear, zfar, world_view_transform, full_proj_transform):

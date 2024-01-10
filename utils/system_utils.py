@@ -13,6 +13,7 @@ from errno import EEXIST
 from os import makedirs, path
 import os
 import yaml
+import torch
 
 def mkdir_p(folder_path):
     # Creates a directory. equivalent to using mkdir -p on the command line
@@ -74,3 +75,10 @@ def update_recursive(dict1, dict2):
             update_recursive(dict1[k], v)
         else:
             dict1[k] = v
+
+def print_memory_usage(log_str=None):
+    if log_str is not None:
+        print (log_str)
+    print("GPU memory usage:")
+    print(f"  Allocated: {torch.cuda.memory_allocated() / (1024 ** 3):.2f} GB")
+    print(f"  Cached: {torch.cuda.memory_cached() / (1024 ** 3):.2f} GB")

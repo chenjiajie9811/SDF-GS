@@ -20,7 +20,7 @@ from gs.gs_model import GaussianModel
 from utils.loss_utils import l1_loss, ssim, sparse_loss, eikonal_loss
 from utils.general_utils import safe_state
 from utils.image_utils import psnr
-from utils.system_utils import load_config
+from utils.system_utils import load_config, print_memory_usage
 from utils.camera_utils import get_camera_center
 from train import eval
 
@@ -88,6 +88,20 @@ def normalize_coordinate(points):
     #max_cor[max_cor == min_cor] = 1.0
 
     return (points - min_cor.values) / (max_cor.values.max())
+
+def generate_3d_grid(resolution):
+    # Generate 1D coordinates along each axis
+    x_coords = torch.linspace(-1, 1, resolution)
+    y_coords = torch.linspace(-1, 1, resolution)
+    z_coords = torch.linspace(-1, 1, resolution)
+
+    # Create a 3D grid using meshgrid
+    x, y, z = torch.meshgrid(x_coords, y_coords, z_coords)
+
+    # Reshape the grid coordinates to obtain a list of 3D points
+    coordinates = torch.column_stack((x.ravel(), y.ravel(), z.ravel()))
+
+    return coordinates
 
 def training(cfg, scene: Scene, saving_iterations):
     cfg_training = cfg['training']
@@ -291,6 +305,27 @@ def test_hash_grid_network():
     
     print ("finished")
 
+def eval_gaussians(res, gaussians : GaussianModel):
+    from flexicubes.flexicubes import FlexiCubes
+    fc = FlexiCubes()
+    x_nx3, cube_fx8 = fc.construct_voxel_grid(res)
+
+    x_nx3 *= 2
+
+    # sdf = torch.rand_like(x_nx3[:,0]) - 0.1 # randomly init SDF
+    sdf = gaussians.depth_gaussian_net.sdf_network.get_sdf_vals(x_nx3)
+    weight = torch.zeros((cube_fx8.shape[0], 21), dtype=torch.float, device='cuda')
+    vertices, faces, L_dev = fc(x_nx3, sdf, cube_fx8, res, beta_fx12=weight[:,:12], alpha_fx8=weight[:,12:20],
+            gamma_f=weight[:,20], training=False)
+
+    sdf_v, feature_v, gradient_v = gaussians.depth_gaussian_net.sdf_network.get_outputs(vertices)
+    gaussian_batch = gaussians.depth_gaussian_net.gaussian_network(vertices, feature_v, gradient_v)
+    gaussians.update_gaussians_from_batch(gaussian_batch)
+    
+    mesh = trimesh.Trimesh(vertices=vertices.detach().cpu(), faces=faces.detach().cpu())
+    mesh.export('./eval.ply')
+
+
 def training_pipeline(cfg, scene: Scene, saving_iterations):
     cfg_training = cfg['training']
     cfg_model = cfg['model']
@@ -323,7 +358,12 @@ def training_pipeline(cfg, scene: Scene, saving_iterations):
         cam_pos = get_camera_center(viewpoint_cam).reshape(-1, 3).cuda().float()
 
         # Update one iteration
-        ret = scene.gaussians.run_pipeline(cam_pos)
+        # ret = scene.gaussians.run_pipeline(cam_pos)
+
+        rays_o, rays_d = viewpoint_cam.generate_rays(4096)
+        # rays_o, rays_d = viewpoint_cam.generate_all_rays(crop_edge=200, down_scale=1)
+        rays_o, rays_d = rays_o.cuda(), rays_d.cuda()
+        gradients = scene.gaussians.run_pipeline(rays_o, rays_d)
         
         # Render
         render_pkg = render(viewpoint_cam, scene.gaussians, cfg['pipeline'], background)
@@ -334,10 +374,11 @@ def training_pipeline(cfg, scene: Scene, saving_iterations):
         Ll1 = l1_loss(image, gt_image)
 
         loss = (1.0 - cfg_training['lambda_dssim']) * Ll1 + cfg_training['lambda_dssim'] * (1.0 - ssim(image, gt_image))
-        loss += 0.1 * eikonal_loss(ret['grad'])
-        if scene.gaussians.use_flexicubs:
-            loss += ret['l'].mean() * 0.5
-            loss += (scene.gaussians.fc_cube_weights[:, :20]).abs().mean() * 0.1
+        # loss += 0.1 * eikonal_loss(ret['grad'])
+        loss += 0.1 * eikonal_loss(gradients)
+        # if scene.gaussians.use_flexicubs:
+        #     loss += ret['l'].mean() * 0.5
+        #     loss += (scene.gaussians.fc_cube_weights[:, :20]).abs().mean() * 0.1
         
         loss.backward(retain_graph=True)
         # print("after one backward")
@@ -357,17 +398,22 @@ def training_pipeline(cfg, scene: Scene, saving_iterations):
                 progress_bar.close()
             
             # Log and save
-            if (iteration in saving_iterations):
-                eval(scene, cfg_model, iteration, cfg['pipeline'], background, skip_train=False, skip_test=False)
-                print("\n[ITER {}] Saving Gaussians".format(iteration))
-                scene.save(iteration)
-                mesh_ = trimesh.Trimesh(vertices=ret['v'].clone().detach().cpu().numpy(), faces=ret['f'].clone().detach().cpu().numpy())
-                mesh_.export(os.path.join(cfg_model['model_path'], "mesh/iteration{}.ply".format(iteration)))
+            # if (iteration in saving_iterations):
+            #     eval_gaussians(128, scene.gaussians)
+            #     eval(scene, cfg_model, iteration, cfg['pipeline'], background, skip_train=False, skip_test=False)
+            #     print("\n[ITER {}] Saving Gaussians".format(iteration))
+            #     scene.save(iteration)
+                # mesh_ = trimesh.Trimesh(vertices=ret['v'].clone().detach().cpu().numpy(), faces=ret['f'].clone().detach().cpu().numpy())
+                # mesh_.export(os.path.join(cfg_model['model_path'], "mesh/iteration{}.ply".format(iteration)))
 
             # Optimizer step
             # if iteration < iterations:
             scene.gaussians.optimizer.step()
             scene.gaussians.optimizer.zero_grad()
+
+        if (iteration in saving_iterations):
+            eval_gaussians(128, scene.gaussians)
+            eval(scene, cfg_model, iteration, cfg['pipeline'], background, skip_train=False, skip_test=False)
 
         # torch.cuda.empty_cache()
 
@@ -378,13 +424,14 @@ def test_gaussian_network_pipeline():
     torch.autograd.set_detect_anomaly(False)
 
     gaussians = GaussianModel(0)
-    gaussians.init_pipeline(resolution=128, use_flexicubes=True)
+    # gaussians.init_pipeline(resolution=128, use_flexicubes=True)
+    gaussians.init_pipeline()
     # gaussians.run_pipeline(torch.zeros(1, 3).cuda())
     # input()
 
     scene = Scene(cfg['model'], gaussians, load_iteration=None)
 
-    training_pipeline(cfg, scene, [i for i in range(0, 30000, 500)])
+    training_pipeline(cfg, scene, [i for i in range(50, 30000, 500)])
     save_points_ply(gaussians.get_xyz, './sampled.ply')
     print ("finished")
 
@@ -396,7 +443,7 @@ def test_depth_rendering():
 
     gaussians = GaussianModel(0)
     # gaussians.init_pipeline(resolution=128, use_flexicubes=True)
-    sdf_network = ImplicitNetworkGrid(15, True, 3, 1, [64, 64], geometric_init=True, multires=6, divide_factor=1.0).to(device)
+    sdf_network = ImplicitNetworkGrid(15, True, 3, 1, [64, 64], geometric_init=True, multires=6, divide_factor=1.5).to(device)
     deviation_network = SingleVarianceNetwork(0.3).to(device)
     neus_renderer = NeuSRenderer(sdf_network, deviation_network, 64, 64, 4, True).to(device)
     
@@ -405,7 +452,9 @@ def test_depth_rendering():
     viewpoint_stack = None
     ema_loss_for_log = 0.0
 
-    for iteration in range(0, 10):        
+    # test_flexicubes(sdf_network)
+
+    for iteration in range(0, 100):        
         # scene.gaussians.update_learning_rate(iteration)
 
         # Pick a random Camera
@@ -413,43 +462,48 @@ def test_depth_rendering():
             viewpoint_stack = scene.getTrainCameras().copy()
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
 
-        cam_pos = viewpoint_cam.camera_center
-        mask = viewpoint_cam.mask
+        # cam_pos = viewpoint_cam.camera_center
+        # print ("cam_pos", cam_pos)
+        # mask = viewpoint_cam.mask
 
-        rays_o, rays_d = viewpoint_cam.generate_rays(2000)
+        rays_o, rays_d = viewpoint_cam.generate_rays(4096)
+        # rays_o, rays_d = viewpoint_cam.generate_all_rays(crop_edge=200, down_scale=1)
         rays_o, rays_d = rays_o.cuda(), rays_d.cuda()
 
         near, far = near_far_from_sphere(rays_o, rays_d)
 
-        print ("rays_o.shape", rays_o.shape)
+        # print ("rays_o.shape", rays_o.shape)
+        print_memory_usage()
 
-        ret = neus_renderer(rays_o, rays_d, near, far)
+        depths, gradients = neus_renderer(rays_o, rays_d, near, far)
 
-        print (ret['depths'].shape)
+        pts = rays_o + rays_d * depths.reshape(-1, 1)
 
 
-        
+        # save_points_ply(pts, "./test_depths.ply")
         input()
 
 
-# def test_flexicubes():
-#     from flexicubes.flexicubes import FlexiCubes
-#     # density_fields = torch.load('./density_field.pt')
-#     # print (density_fields.shape)
-#     fc = FlexiCubes()
-#     x_nx3, cube_fx8 = fc.construct_voxel_grid(64)
-#     # print (x_nx3.shape)
-#     # print (x_nx3.shape)
-#     # print (cube_fx8)
-#     x_nx3 *= 2
+def test_flexicubes(sdf_network):
+    from flexicubes.flexicubes import FlexiCubes
+    # density_fields = torch.load('./density_field.pt')
+    # print (density_fields.shape)
+    res = 128
+    fc = FlexiCubes()
+    x_nx3, cube_fx8 = fc.construct_voxel_grid(res)
+    # print (x_nx3.shape)
+    # print (x_nx3.shape)
+    # print (cube_fx8)
+    x_nx3 *= 2.5
 
-#     sdf = torch.rand_like(x_nx3[:,0]) - 0.1 # randomly init SDF
-#     weight = torch.zeros((cube_fx8.shape[0], 21), dtype=torch.float, device='cuda')
-#     vertices, faces, L_dev = fc(x_nx3, sdf, cube_fx8, 64, beta_fx12=weight[:,:12], alpha_fx8=weight[:,12:20],
-#             gamma_f=weight[:,20], training=False)
+    # sdf = torch.rand_like(x_nx3[:,0]) - 0.1 # randomly init SDF
+    sdf = sdf_network.get_sdf_vals(x_nx3)
+    weight = torch.zeros((cube_fx8.shape[0], 21), dtype=torch.float, device='cuda')
+    vertices, faces, L_dev = fc(x_nx3, sdf, cube_fx8, res, beta_fx12=weight[:,:12], alpha_fx8=weight[:,12:20],
+            gamma_f=weight[:,20], training=False)
     
-#     # mesh = trimesh.Trimesh(vertices=vertices, faces=faces)
-#     # mesh.export('./sampled.ply')
+    mesh = trimesh.Trimesh(vertices=vertices.detach().cpu(), faces=faces.detach().cpu())
+    mesh.export('./sampled.ply')
 
 
 
@@ -466,8 +520,8 @@ if __name__ == '__main__':
     # input()
     # dummy_test_point_rasterization()
     # test_flexicubes()
-    test_depth_rendering()
-    input()
+    # test_depth_rendering()
+    # input()
     test_gaussian_network_pipeline()
     input()
     

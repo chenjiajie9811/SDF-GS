@@ -7,6 +7,8 @@ from grid.embedder import *
 from utils.rigid_utils import exp_so3
 from grid.grid import Grid2Mesh, DenseGrid
 
+from nerf.ray_sampler import NeuSRenderer, near_far_from_sphere, SingleVarianceNetwork
+
 class ImplicitNetwork(nn.Module):
     def __init__(
             self,
@@ -574,7 +576,76 @@ class GaussianNetwork(nn.Module):
             ret['n'] = n
             return gaussians, ret
 
+class GaussianFieldNetwork(nn.Module):
+    def __init__(self, D=64, num_sdf_feat=15, device='cuda'):
+        super(GaussianFieldNetwork, self).__init__()
 
+        self.device = device
+        self.input_ch = num_sdf_feat + 3 + 3 # (sdf feature vector + sdf + x + normal)
+
+        self.linear = nn.ModuleList(
+            [
+                nn.Linear(self.input_ch, D),
+                nn.Linear(D, D),
+            ]
+        )
+
+        self.opacity_lin = nn.Linear(D, 1)
+        self.scaling_lin = nn.Linear(D, 3)
+        self.rotation_angle_lin = nn.Linear(D, 1)
+        self.rgb_lin = nn.Linear(D, 3)
+
+    def forward(self, x, sdf_features, normals):
+
+        h = torch.cat([x, sdf_features, normals], dim=-1)
+
+        for l in self.linear:
+            h = l(h)
+            h = F.relu(h)
+
+        gaussians = dict()
+        gaussians['xyz'] = x
+
+        gaussians['opacity'] = torch.sigmoid(self.opacity_lin(h))
+
+        gaussians['scaling']= torch.sigmoid(self.scaling_lin(h)) * (2. / 100) #* base_scale# need the base scaling
+        rotation_theta = torch.sigmoid(self.rotation_angle_lin(h)) * 2 * torch.pi
+        
+        gaussians['rotation_matrix'] = exp_so3(normals.squeeze(0), rotation_theta.squeeze(0)).unsqueeze(0)
+
+        gaussians['rgb'] = torch.sigmoid(self.rgb_lin(h))
+
+        return gaussians
+
+class DepthGaussianNetwork(nn.Module):
+    def __init__(self, device='cuda'):
+        super(DepthGaussianNetwork, self).__init__()
+
+        self.sdf_network = ImplicitNetworkGrid(15, True, 3, 1, [64, 64], geometric_init=True, multires=6, divide_factor=1.5).to(device)
+        self.deviation_network = SingleVarianceNetwork(0.3).to(device)
+        self.neus_renderer = NeuSRenderer(self.sdf_network, self.deviation_network, 64, 64, 4, True).to(device)
+
+        self.gaussian_network = GaussianFieldNetwork(D=64, num_sdf_feat=15).to(device)
+        # TODO: a new Hash grid for the gaussian network
+
+
+    def forward(self, rays_o, rays_d):
+        near, far = near_far_from_sphere(rays_o, rays_d)
+        depths, gradients_d_samples = self.neus_renderer(rays_o, rays_d, near, far)
+        pts = rays_o + rays_d * depths.reshape(-1, 1)
+
+        sdf, feature_vectors, gradients_d = self.sdf_network.get_outputs(pts)
+
+        gaussians = self.gaussian_network(pts, feature_vectors, gradients_d)
+
+        return {
+            'gaussians' : gaussians,
+            'gradients' : torch.cat([gradients_d_samples, gradients_d], dim=0)
+        }
+
+
+
+    
 
 
 

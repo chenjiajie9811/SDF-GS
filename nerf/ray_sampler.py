@@ -4,8 +4,11 @@ import torch.nn.functional as F
 
 from typing import Callable, List, Optional, Tuple, Union
 
+from utils.system_utils import print_memory_usage
+
 def near_far_from_sphere(rays_o, rays_d):
     a = torch.sum(rays_d**2, dim=-1, keepdim=True)
+
     b = 2.0 * torch.sum(rays_o * rays_d, dim=-1, keepdim=True)
     mid = 0.5 * (-b) / a
     near = mid - 1.0
@@ -159,10 +162,6 @@ class NeuSRenderer(nn.Module):
         # the cos value "not dead" at the beginning training iterations, for better convergence.
         iter_cos = -(F.relu(-true_cos * 0.5 + 0.5) * (1.0 - cos_anneal_ratio) +
                      F.relu(-true_cos) * cos_anneal_ratio)  # always non-positive
-
-        print ("sdf", sdf.shape)
-        print ('iter_cos', iter_cos.shape)
-        print ('dists', dists.reshape(-1, 1).shape)
         
         # Estimate signed distances at section points
         estimated_next_sdf = sdf + iter_cos * dists.reshape(-1, 1) * 0.5
@@ -178,12 +177,11 @@ class NeuSRenderer(nn.Module):
 
         weights = alpha * torch.cumprod(torch.cat([torch.ones([num_rays, 1]).cuda(), 1. - alpha + 1e-7], -1), -1)[:, :-1]
         
+        # print_memory_usage("depth rendering")
+
         depths = torch.sum(weights * z_vals, dim=-1)
 
-        return {
-                'depths' : depths,
-                'gradients' : gradients
-                }
+        return depths, gradients
 
 
     def forward(self, rays_o, rays_d, near, far):
@@ -214,9 +212,7 @@ class NeuSRenderer(nn.Module):
             num_samples = self.num_samples + self.num_importance
 
 
-        ret = self.render_depth(rays_o, rays_d, sample_dist, z_vals, self.sdf_network, self.deviation_network)
-
-        return ret
+        return self.render_depth(rays_o, rays_d, sample_dist, z_vals, self.sdf_network, self.deviation_network)
 
 
 

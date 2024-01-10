@@ -18,7 +18,7 @@ from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotati
 from utils.rigid_utils import matrix_to_quaternion
 
 from grid.grid import DenseGrid, Grid2Mesh
-from grid.network import Mesh2GaussiansNetwork, GaussianNetwork
+from grid.network import Mesh2GaussiansNetwork, GaussianNetwork, DepthGaussianNetwork
 
 from skimage import measure
 from scipy.spatial.transform import Rotation as R
@@ -774,28 +774,53 @@ class GaussianModel:
         # print (self.get_features.shape)
         # print (self.grid.shape)
 
-    def init_pipeline(self, resolution=128, use_flexicubes=False):
-        self.use_flexicubs = use_flexicubes
-        if not use_flexicubes:
-            X = torch.linspace(-1, 1, resolution)
-            Y = torch.linspace(-1, 1, resolution)
-            Z = torch.linspace(-1, 1, resolution)
-            self.grid_coordinate = torch.stack(torch.meshgrid(X, Y, Z, indexing='ij'), dim=-1).view(-1, 3).cuda()
-            self.gaussian_net = GaussianNetwork()
-        else:
-            from flexicubes.flexicubes import FlexiCubes
-            self.fc = FlexiCubes()
-            self.grid_coordinate, self.cube_fx8 = self.fc.construct_voxel_grid(resolution)
-            self.grid_coordinate *= 2
-            fc_cube_weights_ = torch.zeros((self.cube_fx8.shape[0], 21), dtype=torch.float, device=self.device)
-            self.fc_cube_weights = torch.nn.Parameter(fc_cube_weights_.clone().detach(), requires_grad=True)
+    # def init_pipeline(self, resolution=128, use_flexicubes=False):
+    #     self.use_flexicubs = use_flexicubes
+    #     if not use_flexicubes:
+    #         X = torch.linspace(-1, 1, resolution)
+    #         Y = torch.linspace(-1, 1, resolution)
+    #         Z = torch.linspace(-1, 1, resolution)
+    #         self.grid_coordinate = torch.stack(torch.meshgrid(X, Y, Z, indexing='ij'), dim=-1).view(-1, 3).cuda()
+    #         self.gaussian_net = GaussianNetwork()
+    #     else:
+    #         from flexicubes.flexicubes import FlexiCubes
+    #         self.fc = FlexiCubes()
+    #         self.grid_coordinate, self.cube_fx8 = self.fc.construct_voxel_grid(resolution)
+    #         self.grid_coordinate *= 2
+    #         fc_cube_weights_ = torch.zeros((self.cube_fx8.shape[0], 21), dtype=torch.float, device=self.device)
+    #         self.fc_cube_weights = torch.nn.Parameter(fc_cube_weights_.clone().detach(), requires_grad=True)
 
-            self.gaussian_net = GaussianNetwork(self.fc, self.fc_cube_weights, resolution, self.device)
+    #         self.gaussian_net = GaussianNetwork(self.fc, self.fc_cube_weights, resolution, self.device)
         
+    #     l = [
+    #             {'params': list(self.gaussian_net.sdf_grid_net.parameters()), 'lr': 5e-4, "name": "sdf_net"},
+    #             {'params': list(self.gaussian_net.gaussian_geo_from_mesh.parameters()), 'lr': 1e-4, "name": "gauss_geo_net"},
+    #             {'params': list(self.gaussian_net.gaussian_rgb_from_mesh.parameters()), 'lr': 2e-4, "name": "gauss_rgb_net"},
+    #             # {'params': self.fc_cube_weights, 'lr': 2e-4, "name": "fc_weights"}
+    #         ]
+
+    #     self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
+    #     self.sdf_net_lr_scheduler = get_expon_lr_func(lr_init=5e-4,
+    #                                                 lr_final=3e-6,
+    #                                                 lr_delay_mult=0.01,
+    #                                                 max_steps=30_000)
+        
+    #     self.gauss_geo_net_lr_scheduler = get_expon_lr_func(lr_init=1e-4,
+    #                                                 lr_final=1e-6,
+    #                                                 lr_delay_mult=0.01,
+    #                                                 max_steps=30_000)
+        
+    #     self.gauss_rgb_net_lr_scheduler = get_expon_lr_func(lr_init=2e-4,
+    #                                                 lr_final=1e-6,
+    #                                                 lr_delay_mult=0.01,
+    #                                                 max_steps=30_000)
+
+    def init_pipeline(self):
+        self.depth_gaussian_net = DepthGaussianNetwork() 
         l = [
-                {'params': list(self.gaussian_net.sdf_grid_net.parameters()), 'lr': 5e-4, "name": "sdf_net"},
-                {'params': list(self.gaussian_net.gaussian_geo_from_mesh.parameters()), 'lr': 1e-4, "name": "gauss_geo_net"},
-                {'params': list(self.gaussian_net.gaussian_rgb_from_mesh.parameters()), 'lr': 2e-4, "name": "gauss_rgb_net"},
+                {'params': list(self.depth_gaussian_net.sdf_network.parameters()), 'lr': 5e-4, "name": "sdf_net"},
+                {'params': list(self.depth_gaussian_net.deviation_network.parameters()), 'lr': 1e-4, "name": "gauss_geo_net"},
+                {'params': list(self.depth_gaussian_net.gaussian_network.parameters()), 'lr': 2e-4, "name": "gauss_rgb_net"},
                 # {'params': self.fc_cube_weights, 'lr': 2e-4, "name": "fc_weights"}
             ]
 
@@ -815,12 +840,44 @@ class GaussianModel:
                                                     lr_delay_mult=0.01,
                                                     max_steps=30_000)
 
-    def run_pipeline(self, cam_pos):
-        if self.use_flexicubs:
-            gaussians, ret = self.gaussian_net(self.grid_coordinate, cam_pos, self.cube_fx8)
-        else:
-            gaussians, ret = self.gaussian_net(self.grid_coordinate, cam_pos)
+    # def run_pipeline(self, cam_pos):
+    #     if self.use_flexicubs:
+    #         gaussians, ret = self.gaussian_net(self.grid_coordinate, cam_pos, self.cube_fx8)
+    #     else:
+    #         gaussians, ret = self.gaussian_net(self.grid_coordinate, cam_pos)
         
+    #     self._xyz = gaussians['xyz'].squeeze(0)
+    #     features = torch.zeros((self._xyz.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().to(self.device)
+    #     features[:, :3, 0 ] = RGB2SH(gaussians['rgb'].squeeze(0))
+    #     features[:, 3:, 1:] = 0.0
+    #     self._features_dc = features[:,:,0:1].transpose(1, 2).contiguous()
+    #     self._features_rest = features[:,:,1:].transpose(1, 2).contiguous()
+    #     self._features_dc.retain_grad()
+    #     self._features_rest.retain_grad()
+
+    #     self._scaling = self.scaling_inverse_activation(gaussians['scaling'].squeeze(0))
+ 
+    #     self._rotation = matrix_to_quaternion(gaussians['rotation_matrix'].squeeze(0))
+ 
+    #     self._opacity = self.inverse_opacity_activation(gaussians['opacity'].squeeze(0))
+
+    #     # print (self.get_xyz.shape)
+    #     # print (self.get_scaling.shape)
+    #     # print (self.get_rotation.shape)
+    #     # print (self.get_opacity.shape)
+    #     # print (self.get_features.shape)
+        
+    #     # if self.use_flexicubs:
+    #     #     return v.clone().detach().cpu().numpy(), f.clone().detach().cpu().numpy(), l, grad
+    #     # else:
+    #     #     return v.clone().detach().cpu().numpy(), f.clone().detach().cpu().numpy(), n.clone().detach().cpu().numpy(), grad
+    #     return ret
+
+    def run_pipeline(self, rays_o, rays_d):
+        ret = self.depth_gaussian_net(rays_o, rays_d)
+        gaussians = ret['gaussians']
+        gradients = ret['gradients']
+
         self._xyz = gaussians['xyz'].squeeze(0)
         features = torch.zeros((self._xyz.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().to(self.device)
         features[:, :3, 0 ] = RGB2SH(gaussians['rgb'].squeeze(0))
@@ -836,17 +893,23 @@ class GaussianModel:
  
         self._opacity = self.inverse_opacity_activation(gaussians['opacity'].squeeze(0))
 
-        # print (self.get_xyz.shape)
-        # print (self.get_scaling.shape)
-        # print (self.get_rotation.shape)
-        # print (self.get_opacity.shape)
-        # print (self.get_features.shape)
-        
-        # if self.use_flexicubs:
-        #     return v.clone().detach().cpu().numpy(), f.clone().detach().cpu().numpy(), l, grad
-        # else:
-        #     return v.clone().detach().cpu().numpy(), f.clone().detach().cpu().numpy(), n.clone().detach().cpu().numpy(), grad
-        return ret
+        return gradients
+
+    def update_gaussians_from_batch(self, gauss_batch):
+        self._xyz = gauss_batch['xyz'].squeeze(0)
+        features = torch.zeros((self._xyz.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().to(self.device)
+        features[:, :3, 0 ] = RGB2SH(gauss_batch['rgb'].squeeze(0))
+        features[:, 3:, 1:] = 0.0
+        self._features_dc = features[:,:,0:1].transpose(1, 2).contiguous()
+        self._features_rest = features[:,:,1:].transpose(1, 2).contiguous()
+        self._features_dc.retain_grad()
+        self._features_rest.retain_grad()
+
+        self._scaling = self.scaling_inverse_activation(gauss_batch['scaling'].squeeze(0))
+ 
+        self._rotation = matrix_to_quaternion(gauss_batch['rotation_matrix'].squeeze(0))
+ 
+        self._opacity = self.inverse_opacity_activation(gauss_batch['opacity'].squeeze(0))
 
 
 
