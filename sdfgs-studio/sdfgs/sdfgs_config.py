@@ -28,11 +28,12 @@ from nerfstudio.plugins.types import MethodSpecification
 
 SDFGS = MethodSpecification(
     config=TrainerConfig(
-        method_name="SDFGS",  # TODO: rename to your own model
-        steps_per_eval_batch=500,
+        method_name="SDFGS",  
+        steps_per_eval_image=500,
+        # steps_per_eval_batch=5000,
         steps_per_save=2000,
         max_num_iterations=30000,
-        mixed_precision=True,
+        mixed_precision=False,
         pipeline=SDFGSPipelineConfig(
             datamanager=SDFGSDataManagerConfig(
                 dataparser=BlenderDataParserConfig(),
@@ -40,16 +41,16 @@ SDFGS = MethodSpecification(
                 eval_num_rays_per_batch=2048,
             ),
             model=SDFGSModelConfig(
-                sdf_field=SDFFieldConfig(
-                    use_grid_feature=True,
-                    num_layers=2,
-                    num_layers_color=2,
-                    hidden_dim=128,
-                    bias=0.5,
-                    beta_init=0.8,
-                    use_appearance_embedding=False,
-                ),
-                background_model="none",
+                # sdf_field=SDFFieldConfig(
+                #     use_grid_feature=True,
+                #     num_layers=2,
+                #     num_layers_color=2,
+                #     hidden_dim=256,
+                #     bias=0.5,
+                #     beta_init=0.8,
+                #     use_appearance_embedding=False,
+                # ),
+                # background_model="none",
                 eval_num_rays_per_chunk=1024,
             ),
         ),
@@ -61,12 +62,21 @@ SDFGS = MethodSpecification(
             # },
             "fields": {
                 "optimizer": AdamOptimizerConfig(lr=5e-4, eps=1e-15),
-                "scheduler": CosineDecaySchedulerConfig(warm_up_end=500, learning_rate_alpha=0.05, max_steps=20001),
+                "scheduler": CosineDecaySchedulerConfig(warm_up_end=1000, learning_rate_alpha=0.05, max_steps=200001),
             },
             "field_background": {
                 "optimizer": AdamOptimizerConfig(lr=5e-4, eps=1e-15),
-                "scheduler": CosineDecaySchedulerConfig(warm_up_end=500, learning_rate_alpha=0.05, max_steps=20001),
+                "scheduler": CosineDecaySchedulerConfig(warm_up_end=1000, learning_rate_alpha=0.05, max_steps=200000),
             },
+
+            # "fields": {
+            #     "optimizer": AdamOptimizerConfig(lr=5e-4, eps=1e-15),
+            #     "scheduler": CosineDecaySchedulerConfig(warm_up_end=5000, learning_rate_alpha=0.05, max_steps=300000),
+            # },
+            # "field_background": {
+            #     "optimizer": AdamOptimizerConfig(lr=5e-4, eps=1e-15),
+            #     "scheduler": CosineDecaySchedulerConfig(warm_up_end=5000, learning_rate_alpha=0.05, max_steps=300000),
+            # },
         },
         viewer=ViewerConfig(num_rays_per_chunk=1 << 15),
         vis="viewer",
