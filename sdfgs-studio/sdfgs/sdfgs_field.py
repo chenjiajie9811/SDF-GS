@@ -166,31 +166,34 @@ class ImplicitNetworkGrid(nn.Module):
 
     def gradient(self, x):
         x.requires_grad_(True)
-        y = self.forward(x)[:,:1]
-        d_output = torch.ones_like(y, requires_grad=False, device=y.device)
-        gradients = torch.autograd.grad(
-            outputs=y,
-            inputs=x,
-            grad_outputs=d_output,
-            create_graph=True,
-            retain_graph=True,
-            only_inputs=True)[0]
-        return gradients
+        with torch.enable_grad():
+            y = self.forward(x)[:,:1]
+            d_output = torch.ones_like(y, requires_grad=False, device=y.device)
+            gradients = torch.autograd.grad(
+                outputs=y,
+                inputs=x,
+                grad_outputs=d_output,
+                create_graph=True,
+                retain_graph=True,
+                only_inputs=True)[0]
+            return gradients
 
     def get_outputs(self, x):
+        
         x.requires_grad_(True)
-        output = self.forward(x)
-        sdf = output[:,:1]
+        with torch.enable_grad():
+            output = self.forward(x)
+            sdf = output[:,:1]
 
-        feature_vectors = output[:, 1:]
-        d_output = torch.ones_like(sdf, requires_grad=False, device=sdf.device)
-        gradients = torch.autograd.grad(
-            outputs=sdf,
-            inputs=x,
-            grad_outputs=d_output,
-            create_graph=True,
-            retain_graph=True,
-            only_inputs=True)[0]
+            feature_vectors = output[:, 1:]
+            d_output = torch.ones_like(sdf, requires_grad=False, device=sdf.device)
+            gradients = torch.autograd.grad(
+                outputs=sdf,
+                inputs=x,
+                grad_outputs=d_output,
+                create_graph=True,
+                retain_graph=True,
+                only_inputs=True)[0]
 
         return sdf, feature_vectors, gradients
 
