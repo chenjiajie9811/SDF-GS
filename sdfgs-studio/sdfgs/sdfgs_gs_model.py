@@ -8,11 +8,10 @@ import torch.nn.functional as F
 from dataclasses import dataclass, field
 from typing import Type, Literal, Tuple, Union, Dict, List, cast
 
-from sdfgs.sdfgs_field import SDFGSField, SDFGSFieldConfig, MeshGaussiansField, MeshGaussiansFieldConfig
+from sdfgs.sdfgs_field import ImplicitNetworkGrid
+from sdfgs.sdfgs_gs_field import RenderingNetwork, MeshGaussiansField, MeshGaussiansFieldConfig
 from sdfgs.gs_renderer import GSCameraInfo, GaussianRenderer
 
-from nerfstudio.models.nerfacto import NerfactoModel, NerfactoModelConfig  # for subclassing Nerfacto model
-from nerfstudio.models.neus import NeuSModel, NeuSModelConfig
 from nerfstudio.models.base_model import Model, ModelConfig  # for custom Model
 
 from nerfstudio.cameras.rays import RayBundle
@@ -108,8 +107,20 @@ class SDFGSGaussianModelConfig(ModelConfig):
 
     gs_field: MeshGaussiansFieldConfig = field(default_factory=MeshGaussiansFieldConfig)
 
-    white_background = True
+    sh_degree: int = 0
+    """maximum degree of spherical harmonics to use"""
+
+    white_background: bool = True
+
+    ssim_lambda: float = 0.2
+
+    use_scale_regularization: bool = False
+    """If enabled, a scale regularization introduced in PhysGauss (https://xpandora.github.io/PhysGaussian/) is used for reducing huge spikey gaussians."""
     
+    max_gauss_ratio: float = 10.0
+    """threshold of ratio of gaussian max to min scale before applying regularization
+    loss from the PhysGaussian paper
+    """
 
 
 class SDFGSGaussianModel(Model):
@@ -140,32 +151,55 @@ class SDFGSGaussianModel(Model):
         self.ssim = structural_similarity_index_measure
         self.lpips = LearnedPerceptualImagePatchSimilarity()
 
+        self.step = 0
+
+    def step_cb(self, step):
+        self.step = step
+
     def get_param_groups(self) -> Dict[str, List[nn.Parameter]]:
         param_groups = {}
         param_groups["fields"] = list(self.field.parameters())
         return param_groups
 
 
-    def get_outputs(self, camera: Cameras) -> Dict[str, Union[torch.Tensor, List]]:
-        if not isinstance(camera, Cameras):
+    def get_outputs(self, view_camera: Cameras, sdf_network : ImplicitNetworkGrid) -> Dict[str, Union[torch.Tensor, List]]:
+        if not isinstance(view_camera, Cameras):
             print("Called get_outputs with not a camera")
             return {}
-        assert camera.shape[0] == 1, "Only one camera at a time"
+        assert view_camera.shape[0] == 1, "Only one camera at a time"
 
-        gs_camera_info = parse_camera_info(camera, self.device)
+        gs_camera_info = parse_camera_info(view_camera, self.device)
 
-        #TODO:
         self.field.update_gaussians(gs_camera_info.camera_center, sdf_network)
 
-        render_output = self.renderer.render(gs_camera_info, self.field, self.background_color)
+        render_pkg = self.renderer.render(gs_camera_info, self.field, self.background_color)
 
+        # image, depth, viewspace_point_tensor, visibility_filter, radii = \
+        #     render_pkg["image"], render_pkg["depth"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
+        return {"rgb": render_pkg["image"], "depth": render_pkg["depth"]}
 
+    def get_metrics_dict(self, outputs, batch) -> Dict[str, torch.Tensor]:
+        """Compute and returns metrics.
 
+        Args:
+            outputs: the output to compute loss dict to
+            batch: ground truth batch corresponding to outputs
+        """
+        # d = self._get_downscale_factor()
+        # if d > 1:
+        #     newsize = [batch["image"].shape[0] // d, batch["image"].shape[1] // d]
+        #     gt_img = TF.resize(batch["image"].permute(2, 0, 1), newsize, antialias=None).permute(1, 2, 0)
+        # else:
+        gt_img = batch["image"]
+        metrics_dict = {}
+        gt_rgb = gt_img.to(self.device)  # RGB or RGBA image
+        predicted_rgb = outputs["rgb"]
+        metrics_dict["psnr"] = self.psnr(predicted_rgb, gt_rgb)
 
-
-
-       
+        # self.camera_optimizer.get_metrics_dict(metrics_dict)
+        metrics_dict["gaussian_count"] = self.field.get_num_gaussians
+        return metrics_dict
 
     def get_loss_dict(self, outputs, batch, metrics_dict=None) -> Dict[str, torch.Tensor]:
         """Computes and returns the losses dict.
@@ -175,105 +209,83 @@ class SDFGSGaussianModel(Model):
             batch: ground truth batch corresponding to outputs
             metrics_dict: dictionary of metrics, some of which we can use for loss
         """
-        loss_dict = {}
-        image = batch["image"].to(self.device)
-        pred_image, image = self.renderer_rgb.blend_background_for_loss_computation(
-            pred_image=outputs["rgb"],
-            pred_accumulation=outputs["accumulation"],
-            gt_image=image,
-        )
-        loss_dict["rgb_loss"] = self.rgb_loss(image, pred_image)
-        if self.training:
-            # eikonal loss
-            grad_theta = outputs["eik_grad"]
-            loss_dict["eikonal_loss"] = ((grad_theta.norm(2, dim=-1) - 1) ** 2).mean() * self.config.eikonal_loss_mult
-
-            # foreground mask loss
-            if "fg_mask" in batch and self.config.fg_mask_loss_mult > 0.0:
-                fg_label = batch["fg_mask"].float().to(self.device)
-                weights_sum = outputs["weights"].sum(dim=1).clip(1e-3, 1.0 - 1e-3)
-                loss_dict["fg_mask_loss"] = (
-                    F.binary_cross_entropy(weights_sum, fg_label) * self.config.fg_mask_loss_mult
+        # d = self._get_downscale_factor()
+        # if d > 1:
+        #     newsize = [batch["image"].shape[0] // d, batch["image"].shape[1] // d]
+        #     gt_img = TF.resize(batch["image"].permute(2, 0, 1), newsize, antialias=None).permute(1, 2, 0)
+        # else:
+        gt_img : torch.Tensor = batch["image"]
+        Ll1 = torch.abs(gt_img - outputs["rgb"]).mean()
+        simloss = 1 - self.ssim(gt_img.permute(2, 0, 1)[None, ...], outputs["rgb"].permute(2, 0, 1)[None, ...])
+        if self.config.use_scale_regularization and self.step % 10 == 0:
+            scale_exp = torch.exp(self.field.get_scaling)
+            scale_reg = (
+                torch.maximum(
+                    scale_exp.amax(dim=-1) / scale_exp.amin(dim=-1), torch.tensor(self.config.max_gauss_ratio)
                 )
+                - self.config.max_gauss_ratio
+            )
+            scale_reg = 0.1 * scale_reg.mean()
+        else:
+            scale_reg = torch.tensor(0.0).to(self.device)
 
-        return loss_dict
+        return {
+            "main_loss": (1 - self.config.ssim_lambda) * Ll1 + self.config.ssim_lambda * simloss,
+            "scale_reg": scale_reg,
+        }
 
-    def get_metrics_dict(self, outputs, batch) -> Dict[str, torch.Tensor]:
-        """Compute and returns metrics.
+    @torch.no_grad()
+    def get_outputs_for_camera(self, camera: Cameras) -> Dict[str, torch.Tensor]:
+        """Takes in a camera, generates the raybundle, and computes the output of the model.
+        Overridden for a camera-based gaussian model.
 
         Args:
-            outputs: the output to compute loss dict to
-            batch: ground truth batch corresponding to outputs
+            camera: generates raybundle
         """
-        metrics_dict = {}
-        image = batch["image"].to(self.device)
-        image = self.renderer_rgb.blend_background(image)
-        metrics_dict["psnr"] = self.psnr(outputs["rgb"], image)
-        return metrics_dict
+        assert camera is not None, "must provide camera to gaussian model"
+        # self.set_crop(obb_box)
+        outs = self.get_outputs(camera.to(self.device))
+        return outs  # type: ignore
 
     def get_image_metrics_and_images(
         self, outputs: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor]
     ) -> Tuple[Dict[str, float], Dict[str, torch.Tensor]]:
         """Writes the test image outputs.
+
         Args:
-            outputs: Outputs of the model.
+            image_idx: Index of the image.
+            step: Current step.
             batch: Batch of data.
+            outputs: Outputs of the model.
 
         Returns:
             A dictionary of metrics.
         """
-        image = batch["image"].to(self.device)
-        image = self.renderer_rgb.blend_background(image)
-        rgb = outputs["rgb"]
-        acc = colormaps.apply_colormap(outputs["accumulation"])
+        # d = self._get_downscale_factor()
+        # if d > 1:
+        #     newsize = [batch["image"].shape[0] // d, batch["image"].shape[1] // d]
+        #     gt_img = TF.resize(batch["image"].permute(2, 0, 1), newsize, antialias=None).permute(1, 2, 0)
+        #     predicted_rgb = TF.resize(outputs["rgb"].permute(2, 0, 1), newsize, antialias=None).permute(1, 2, 0)
+        # else:
+        gt_img = batch["image"]
+        predicted_rgb = outputs["rgb"]
 
-        normal = outputs["normal"]
-        normal = (normal + 1.0) / 2.0
+        gt_rgb = gt_img.to(self.device)
 
-        combined_rgb = torch.cat([image, rgb], dim=1)
-        combined_acc = torch.cat([acc], dim=1)
-        if "depth" in batch:
-            depth_gt = batch["depth"].to(self.device)
-            depth_pred = outputs["depth"]
-
-            # align to predicted depth and normalize
-            scale, shift = normalized_depth_scale_and_shift(
-                depth_pred[None, ..., 0], depth_gt[None, ...], depth_gt[None, ...] > 0.0
-            )
-            depth_pred = depth_pred * scale + shift
-
-            combined_depth = torch.cat([depth_gt[..., None], depth_pred], dim=1)
-            combined_depth = colormaps.apply_depth_colormap(combined_depth)
-        else:
-            depth = colormaps.apply_depth_colormap(
-                outputs["depth"],
-                accumulation=outputs["accumulation"],
-            )
-            combined_depth = torch.cat([depth], dim=1)
-
-        if "normal" in batch:
-            normal_gt = (batch["normal"].to(self.device) + 1.0) / 2.0
-            combined_normal = torch.cat([normal_gt, normal], dim=1)
-        else:
-            combined_normal = torch.cat([normal], dim=1)
-
-        images_dict = {
-            "img": combined_rgb,
-            "accumulation": combined_acc,
-            "depth": combined_depth,
-            "normal": combined_normal,
-        }
+        combined_rgb = torch.cat([gt_rgb, predicted_rgb], dim=1)
 
         # Switch images from [H, W, C] to [1, C, H, W] for metrics computations
-        image = torch.moveaxis(image, -1, 0)[None, ...]
-        rgb = torch.moveaxis(rgb, -1, 0)[None, ...]
+        gt_rgb = torch.moveaxis(gt_rgb, -1, 0)[None, ...]
+        predicted_rgb = torch.moveaxis(predicted_rgb, -1, 0)[None, ...]
 
-        psnr = self.psnr(image, rgb)
-        ssim = self.ssim(image, rgb)
-        lpips = self.lpips(image, rgb)
+        psnr = self.psnr(gt_rgb, predicted_rgb)
+        ssim = self.ssim(gt_rgb, predicted_rgb)
+        lpips = self.lpips(gt_rgb, predicted_rgb)
 
         # all of these metrics will be logged as scalars
         metrics_dict = {"psnr": float(psnr.item()), "ssim": float(ssim)}  # type: ignore
         metrics_dict["lpips"] = float(lpips)
+
+        images_dict = {"img": combined_rgb}
 
         return metrics_dict, images_dict

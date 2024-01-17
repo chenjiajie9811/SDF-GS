@@ -1,13 +1,20 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+from torch import Tensor
+from jaxtyping import Float
+from sdfgs.embedder import *
 import numpy as np
 
 from dataclasses import dataclass, field
 from typing import Dict, Literal, Optional, Type
 
 from sdfgs.embedder import *
+from sdfgs.sdfgs_field import ImplicitNetworkGrid, SDFGSFieldConfig
+
+import trimesh
+from nerfstudio.exporter.marching_cubes import generate_mesh_with_multires_marching_cubes
+
 from nerfstudio.cameras.rays import RaySamples
 from nerfstudio.field_components.field_heads import FieldHeadNames
 
@@ -18,141 +25,87 @@ from utils.sh_utils import eval_sh, SH2RGB, RGB2SH
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
-from utils.rigid_utils import matrix_to_quaternion
+from utils.rigid_utils import matrix_to_quaternion, exp_so3
 
 
-from hashencoder.hashgrid import _hash_encode, HashEncoder
-class HashGeoFeature(nn.Module):
-    def __init__(
-            self,
-            sdf_bounding_sphere,
-            d_in=3,
-            d_out=16,
-            dims=[64, 64],
-            geometric_init=True,
-            bias=1.0,
-            skip_in=(),
-            weight_norm=True,
-            multires=0,
-            sphere_scale=1.0,
-            inside_outside=False,
-            base_size = 16, #16,
-            end_size = 2048,#2048,
-            logmap = 19,#19,
-            num_levels=16,#16,
-            level_dim=2,
-            divide_factor = 1.5, # used to normalize the points range for multi-res grid
-            use_grid_feature = True
-    ):
+class RenderingNetwork(nn.Module):
+    def __init__(self,
+                 d_feature,
+                 d_in,
+                 d_out,
+                 d_hidden,
+                 n_layers,
+                 weight_norm=True,
+                 multires_view=0,
+                 squeeze_out=True):
         super().__init__()
-        self.sdf_bounding_sphere = sdf_bounding_sphere
-        self.sphere_scale = sphere_scale
-        dims = [d_in] + dims + [d_out]
-        self.embed_fn = None
-        self.divide_factor = divide_factor
-        self.grid_feature_dim = num_levels * level_dim
-        self.use_grid_feature = use_grid_feature
-        dims[0] += self.grid_feature_dim
-        
-        print(f"using hash encoder with {num_levels} levels, each level with feature dim {level_dim}")
-        print(f"resolution:{base_size} -> {end_size} with hash map size {logmap}")
-        self.encoding = HashEncoder(input_dim=3, num_levels=num_levels, level_dim=level_dim, 
-                    per_level_scale=2, base_resolution=base_size, 
-                    log2_hashmap_size=logmap, desired_resolution=end_size)
 
-        if multires > 0:
-            embed_fn, input_ch = get_embedder(multires, input_dims=d_in)
-            self.embed_fn = embed_fn
-            dims[0] += input_ch - 3
-            print ("input_ch", input_ch)
-        print("network architecture")
-        print(dims)
-        
+        self.squeeze_out = squeeze_out
+        dims = [d_in + d_feature] + [d_hidden for _ in range(n_layers)] + [d_out]
+
+        self.embedview_fn = None
+        if multires_view > 0:
+            embedview_fn, input_ch = get_embedder(multires_view)
+            self.embedview_fn = embedview_fn
+            dims[0] += (input_ch - 3)
 
         self.num_layers = len(dims)
-        self.skip_in = skip_in
 
         for l in range(0, self.num_layers - 1):
-            if l + 1 in self.skip_in:
-                out_dim = dims[l + 1] - dims[0]
-            else:
-                out_dim = dims[l + 1]
-
+            out_dim = dims[l + 1]
             lin = nn.Linear(dims[l], out_dim)
-
-            if geometric_init:
-                if l == self.num_layers - 2:
-                    if not inside_outside:
-                        torch.nn.init.normal_(lin.weight, mean=np.sqrt(np.pi) / np.sqrt(dims[l]), std=0.0001)
-                        torch.nn.init.constant_(lin.bias, -bias)
-                    else:
-                        torch.nn.init.normal_(lin.weight, mean=-np.sqrt(np.pi) / np.sqrt(dims[l]), std=0.0001)
-                        torch.nn.init.constant_(lin.bias, bias)
-
-                elif multires > 0 and l == 0:
-                    torch.nn.init.constant_(lin.bias, 0.0)
-                    torch.nn.init.constant_(lin.weight[:, 3:], 0.0)
-                    torch.nn.init.normal_(lin.weight[:, :3], 0.0, np.sqrt(2) / np.sqrt(out_dim))
-                elif multires > 0 and l in self.skip_in:
-                    torch.nn.init.constant_(lin.bias, 0.0)
-                    torch.nn.init.normal_(lin.weight, 0.0, np.sqrt(2) / np.sqrt(out_dim))
-                    torch.nn.init.constant_(lin.weight[:, -(dims[0] - 3):], 0.0)
-                else:
-                    torch.nn.init.constant_(lin.bias, 0.0)
-                    torch.nn.init.normal_(lin.weight, 0.0, np.sqrt(2) / np.sqrt(out_dim))
 
             if weight_norm:
                 lin = nn.utils.weight_norm(lin)
 
             setattr(self, "lin" + str(l), lin)
 
-        self.softplus = nn.Softplus(beta=100)
-        self.cache_sdf = None
+        self.relu = nn.ReLU()
+
+        self.scaling_lin = nn.Linear(d_hidden, 3)
+        self.rotation_angle_lin = nn.Linear(d_hidden, 1)
 
 
-    def forward(self, input):
-        if self.use_grid_feature:
-            # normalize point range as encoding assume points are in [-1, 1]
-            feature = self.encoding(input / self.divide_factor)
-        else:
-            feature = torch.zeros_like(input[:, :1].repeat(1, self.grid_feature_dim))
-                    
-        if self.embed_fn is not None:
-            embed = self.embed_fn(input)
-            input = torch.cat((embed, feature), dim=-1)
-        else:
-            input = torch.cat((input, feature), dim=-1)
+    def forward(self, points, normals, view_dirs, feature_vectors, pred_gauss_params=False):
+        if self.embedview_fn is not None:
+            view_dirs = self.embedview_fn(view_dirs)
 
-        x = input
+        rendering_input = torch.cat([points, view_dirs, normals, feature_vectors], dim=-1)
+        
+        x = rendering_input
 
         for l in range(0, self.num_layers - 1):
             lin = getattr(self, "lin" + str(l))
-
-            if l in self.skip_in:
-                x = torch.cat([x, input], 1) / np.sqrt(2)
 
             x = lin(x)
 
             if l < self.num_layers - 2:
-                x = self.softplus(x)
+                x = self.relu(x)
 
-        return x
-    
-    def mlp_parameters(self):
-        parameters = []
-        for l in range(0, self.num_layers - 1):
-            lin = getattr(self, "lin" + str(l))
-            parameters += list(lin.parameters())
-        return parameters
+            if l == self.num_layers - 2:
+                h = x
 
-    def grid_parameters(self):
-        print("grid parameters", len(list(self.encoding.parameters())))
-        for p in self.encoding.parameters():
-            print(p.shape)
-        return self.encoding.parameters()
+        if self.squeeze_out:
+            x = torch.sigmoid(x)
+
+        ret = {'color' : x}
+
+        if pred_gauss_params:
+            scale = torch.sigmoid(self.scaling_lin(h))
+            rotation_theta = torch.sigmoid(self.rotation_angle_lin(h)) * 2 * torch.pi
+
+            ret['scale'] = scale
+            ret['rotation_angle'] = rotation_theta 
+
+        
+        return ret
 
 
-class MeshGaussians(nn.Module):
+@dataclass 
+class MeshGaussiansFieldConfig(SDFGSFieldConfig):
+    _target: Type = field(default_factory=lambda: MeshGaussiansField)
+
+class MeshGaussiansField(nn.Module):
 
     def setup_functions(self):
         def build_covariance_from_scaling_rotation(scaling, scaling_modifier, rotation):
@@ -171,7 +124,20 @@ class MeshGaussians(nn.Module):
 
         self.rotation_activation = torch.nn.functional.normalize
 
-    def __init__(self, sh_degree : int, device='cuda'):
+        
+
+    def __init__(
+        self, sh_degree : int, 
+        config: SDFGSFieldConfig,
+        sdf_network : ImplicitNetworkGrid,
+        shared_color_network : RenderingNetwork,
+        device='cuda'
+    ):
+        super(MeshGaussiansField, self).__init__()
+
+        self.config = config
+        
+        # Gaussian parameters
         self.active_sh_degree = 0
         self.max_sh_degree = sh_degree  
         self._xyz = torch.empty(0)
@@ -189,22 +155,106 @@ class MeshGaussians(nn.Module):
         self.device = device
         self.setup_functions()
 
+        # Networks
+        self.geo_network = ImplicitNetworkGrid(
+            feature_vector_size=config.geo_feat_dim,
+            sdf_bounding_sphere=True,
+            d_in=3,
+            d_out=1,
+            dims=[config.hidden_dim] * config.num_layers,
+            geometric_init=config.geometric_init,
+            bias=config.bias,
+            multires=6
+        )
+
+        self.sdf_network = sdf_network
+
+        # self.deviation_network = LearnedVariance(init_val=config.beta_init)
+        self.shared_color_network = shared_color_network
+
+        # Mesh related
         self.vertices = torch.empty(0)
         self.faces = torch.empty(0)
-        self.faces_normal = torch.empty(0)
+        self.center_normal = torch.empty(0)
+
+        # From SuGar
+        self.surface_triangle_circle_radius = 1. / 2. / np.sqrt(3.)
+        self.bary_coords = torch.tensor([[1/3, 1/3, 1/3]], dtype=torch.float32, device=self.device)[..., None]
+
+        # Initialize the Gaussians from sdf network
+        init_mesh = self.marching_cubes(sdf_network, resolution=128)
+        self.update_mesh_info(init_mesh)
     
-    def update_mesh_info(self, vertices, faces):
-        self.vertices = vertices
-        self.faces = faces
+    @torch.no_grad()
+    def marching_cubes(self, sdf_network : ImplicitNetworkGrid, resolution=128):
+        mesh : trimesh.Trimesh = generate_mesh_with_multires_marching_cubes(
+                                    sdf_network, 
+                                    resolution, 
+                                    bounding_box_min=(-1.5, -1.5, -1.5), 
+                                    bounding_box_max=(1.5, 1.5, 1.5), 
+                                    isosurface_threshold=0)
+        
+        return mesh
+    
+    def update_mesh_info(self, mesh):
+        self.update_gaussians_center_info(mesh.vertices, mesh.faces)
 
-        vec1 = vertices[:, faces[:, 0].flatten()] - vertices[:, faces[:, 1].flatten()] 
-        vec2 = vertices[:, faces[:, 0].flatten()] - vertices[:, faces[:, 2].flatten()] 
+    def update_gaussians_center_info(self, vertices, faces):
+        self.vertices = torch.tensor(vertices, device=self.device)
+        self.faces = torch.tensor(faces, device=self.device)
+
+        self._xyz = 1. / 3. * (self.vertices[:, self.faces[:, 0].flatten()] + \
+                                self.vertices[:, self.faces[:, 1].flatten()] + \
+                                self.vertices[:, self.faces[:, 2].flatten()])      
+
+        vec1 = self.vertices[:, self.faces[:, 0].flatten()] - self.vertices[:, self.faces[:, 1].flatten()] 
+        vec2 = self.vertices[:, self.faces[:, 0].flatten()] - self.vertices[:, self.faces[:, 2].flatten()] 
         cross_pro = torch.cross(vec1, vec2, dim=-1)
-        self.faces_normal = F.normalize(cross_pro)
+        self.center_normal = F.normalize(cross_pro)
 
-        self._xyz = 1. / 3. * (vertices[:, faces[:, 0].flatten()] + \
-                                vertices[:, faces[:, 1].flatten()] + \
-                                vertices[:, faces[:, 2].flatten()]) 
+           
+
+    def update_gaussians(self, camera_center : Tensor, sdf_network : ImplicitNetworkGrid):
+        """
+            1. Synchronize the mesh by moving the vertices towards the zero level set 
+            according to the estimation of the current sdf network
+            2. Update the gaussian xyz and normal according to the updated mesh
+            3. Go through the geo_network for estimating the gaussian opacity and output a geo feature vector
+            4. Go through the shared rendering network for estimating the shared color, the gaussian scales, and rotation angle
+            5. Set up all the up-to-date Gaussians parameters
+        """
+        #1.
+        sdf, _, gradients = sdf_network.get_outputs(self.vertices)
+        self.vertices = self.vertices - sdf * F.normalize(gradients, dim=-1)
+
+        #2.
+        self.update_gaussians_center_info(self.vertices, self.faces)
+
+        #3.
+        geo_output = self.geo_network.forward(self._xyz)
+        opacity, geo_feat_vecs = torch.split(geo_output, [1, self.config.geo_feat_dim], dim=-1)
+
+        #4. 
+        view_dir = F.normalize(self._xyz - camera_center, dim=-1)
+        color_output = self.shared_color_network.forward(self._xyz, self.center_normal, view_dir, geo_feat_vecs, pred_gauss_params=True)
+
+        #5.
+        features = torch.zeros((self._xyz.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().to(self.device)
+        features[:, :3, 0 ] = RGB2SH(color_output['color'].squeeze(0))
+        features[:, 3:, 1:] = 0.0
+        self._features_dc = features[:,:,0:1].transpose(1, 2).contiguous()
+        self._features_rest = features[:,:,1:].transpose(1, 2).contiguous()
+        self._features_dc.retain_grad()
+        self._features_rest.retain_grad()
+
+        self._scaling = self.scaling_inverse_activation(color_output['scale'])
+ 
+        rotation_matrix = exp_so3(self.center_normal.squeeze(0), color_output['rotation_angle'].squeeze(0))
+        self._rotation = matrix_to_quaternion(rotation_matrix)
+ 
+        self._opacity = self.inverse_opacity_activation(opacity)
+
+
 
     def training_setup(self, training_args):
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device=self.device)
@@ -232,6 +282,10 @@ class MeshGaussians(nn.Module):
     @property
     def get_opacity(self):
         return self.opacity_activation(self._opacity)
+
+    @property
+    def get_num_gaussians(self):
+        return self._xyz.shape[0]
     
     def get_covariance(self, scaling_modifier = 1):
         return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
@@ -259,4 +313,7 @@ class MeshGaussians(nn.Module):
                                                     lr_final=training_args['position_lr_final']*self.spatial_lr_scale,
                                                     lr_delay_mult=training_args['position_lr_delay_mult'],
                                                     max_steps=training_args['position_lr_max_steps'])
+
+    def forward(self, **kwargs):
+        pass
         
