@@ -32,7 +32,7 @@ from nerfstudio.plugins.types import MethodSpecification
 SDFGS = MethodSpecification(
     config=TrainerConfig(
         method_name="SDFGS",  
-        steps_per_eval_image=500,
+        steps_per_eval_image=50,
         steps_per_eval_all_images=50000000,
         steps_per_save=2000,
         max_num_iterations=30000,
@@ -42,8 +42,8 @@ SDFGS = MethodSpecification(
                 dataparser=BlenderDataParserConfig(
                     data=Path('/usr/stud/chj/storage/user/chj/datasets/lego')
                 ),
-                train_num_rays_per_batch=512,
-                eval_num_rays_per_batch=512,
+                train_num_rays_per_batch=4096,
+                eval_num_rays_per_batch=4096,
             ),
             # model=SDFGSModelConfig(
             #     eval_num_rays_per_chunk=1024,

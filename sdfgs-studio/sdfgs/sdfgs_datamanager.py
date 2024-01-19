@@ -278,7 +278,7 @@ class SDFGSDataManager(DataManager, Generic[TDataset]):
             camera.metadata = {}
         camera.metadata["cam_idx"] = image_idx
 
-        return ray_bundle, ray_batch, camera, img_data
+        return ray_bundle, ray_batch, camera, {"image" : img_data}
 
     def next_eval(self, step: int) -> Tuple[RayBundle, Dict, Cameras, Dict]:
         """Returns the next batch of data from the eval dataloader.
@@ -297,27 +297,32 @@ class SDFGSDataManager(DataManager, Generic[TDataset]):
         if len(self.eval_unseen_cameras) == 0:
             self.eval_unseen_cameras = [i for i in range(len(self.eval_dataset))]
         img_data = deepcopy(image_batch['image'][image_idx])
-        img_data["image"] = img_data["image"].to(self.device)
+        # img_data["image"] = img_data["image"].to(self.device)
+        img_data = img_data.to(self.device)
         assert len(self.eval_dataset.cameras.shape) == 1, "Assumes single batch dimension"
         camera = self.eval_dataset.cameras[image_idx : image_idx + 1].to(self.device)
 
-        return ray_bundle, ray_batch, camera, img_data
+        return ray_bundle, ray_batch, camera, {"image" : img_data}
 
     def next_eval_image(self, step: int) -> Tuple[Cameras, Dict]:
         """Returns the next evaluation batch
 
         Returns a Camera instead of raybundle
 
-        TODO: Make sure this logic is consistent with the vanilladatamanager"""
-        image_idx = self.eval_unseen_cameras.pop(random.randint(0, len(self.eval_unseen_cameras) - 1))
-        # Make sure to re-populate the unseen cameras list if we have exhausted it
-        if len(self.eval_unseen_cameras) == 0:
-            self.eval_unseen_cameras = [i for i in range(len(self.eval_dataset))]
-        data = deepcopy(self.cached_eval[image_idx])
-        data["image"] = data["image"].to(self.device)
-        assert len(self.eval_dataset.cameras.shape) == 1, "Assumes single batch dimension"
-        camera = self.eval_dataset.cameras[image_idx : image_idx + 1].to(self.device)
-        return camera, data
+        # TODO: Make sure this logic is consistent with the vanilladatamanager"""
+        # image_idx = self.eval_unseen_cameras.pop(random.randint(0, len(self.eval_unseen_cameras) - 1))
+        # # Make sure to re-populate the unseen cameras list if we have exhausted it
+        # if len(self.eval_unseen_cameras) == 0:
+        #     self.eval_unseen_cameras = [i for i in range(len(self.eval_dataset))]
+        # data = deepcopy(self.cached_eval[image_idx])
+        # data["image"] = data["image"].to(self.device)
+        # assert len(self.eval_dataset.cameras.shape) == 1, "Assumes single batch dimension"
+        # camera = self.eval_dataset.cameras[image_idx : image_idx + 1].to(self.device)
+        # return camera, data
+    
+        for camera, batch in self.eval_dataloader:
+            assert camera.shape[0] == 1
+            return camera, batch
     
     def get_train_rays_per_batch(self) -> int:
         if self.train_pixel_sampler is not None:

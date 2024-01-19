@@ -101,6 +101,41 @@ class RenderingNetwork(nn.Module):
         
         return ret
 
+# class GaussianGeoNetwork(nn.Module):
+#     def __init__(self,
+#                  d_feature,
+#                  d_in,
+#                  d_hidden,
+#                  n_layers,
+#                  weight_norm=True,
+#                  multires_view=0,
+#                 ):
+#         super().__init__()
+
+#         dims = [d_in + d_feature] + [d_hidden for _ in range(n_layers)]
+
+#         self.embedview_fn = None
+#         if multires_view > 0:
+#             embedview_fn, input_ch = get_embedder(multires_view)
+#             self.embedview_fn = embedview_fn
+#             dims[0] += (input_ch - 3)
+
+#         self.num_layers = len(dims)
+
+#         for l in range(0, self.num_layers - 1):
+#             out_dim = dims[l + 1]
+#             lin = nn.Linear(dims[l], out_dim)
+
+#             if weight_norm:
+#                 lin = nn.utils.weight_norm(lin)
+
+#             setattr(self, "lin" + str(l), lin)
+
+#         self.relu = nn.ReLU()
+
+#         self.rotation_angle = nn.Linear(d_hidden, 1)
+#         self.scale = nn.Linear(d_hidden, 3)
+
 
 @dataclass 
 class MeshGaussiansFieldConfig(SDFGSFieldConfig):
@@ -189,9 +224,9 @@ class MeshGaussiansField(Field):
         
         v = (v / resolution - 0.5) * 2.0 * 1.5
 
-        print ('after marching cubes')
-        print (v.min())
-        print (v.max())
+        # print ('after marching cubes')
+        # print (v.min())
+        # print (v.max())
         self.update_gaussians_center_info(np.ascontiguousarray(v), np.ascontiguousarray(f))
     
     def generate_3d_grid(self,
@@ -227,8 +262,8 @@ class MeshGaussiansField(Field):
 
 
     def update_gaussians_center_info(self, vertices, faces):
-        print (vertices.shape)
-        print (type(vertices))
+        # print (vertices.shape)
+        # print (type(vertices))
         self.vertices = torch.tensor(vertices, device=self.device)
         self.faces = torch.tensor(faces, device=self.device)
 
@@ -257,24 +292,25 @@ class MeshGaussiansField(Field):
             5. Set up all the up-to-date Gaussians parameters
         """
         #1.
-        print ("before vertices move")
-        print (self.vertices)
+        # print ("before vertices move")
+        # print (self.vertices)
         
         sdf, _, gradients = sdf_network.get_outputs(self.vertices)
         self.vertices = self.vertices - sdf * F.normalize(gradients, dim=-1)
 
-        print ("after vertice move")
-        print (self.vertices)
+        # print ("after vertice move")
+        # print (self.vertices)
 
         #2.
         self.update_gaussians_center_info(self.vertices, self.faces)
 
         #3.
         geo_output = self.geo_network.forward(self._xyz)
-        opacity = geo_output[:, :1]
+        opacity = torch.sigmoid(geo_output[:, :1])
         geo_feat_vecs = geo_output[:, 1:]
         # opacity, geo_feat_vecs = torch.split(geo_output, [1, self.config.geo_feat_dim], dim=-1)
-        opacity[torch.isnan(opacity)] = 0.
+        # opacity[torch.isnan(opacity)] = 0.
+        # print ("opacity after set nan to 0", opacity)
 
         #4. 
         view_dir = F.normalize(self._xyz - camera_center, dim=-1)
@@ -286,8 +322,8 @@ class MeshGaussiansField(Field):
         features[:, 3:, 1:] = 0.0
         self._features_dc = features[:,:,0:1].transpose(1, 2).contiguous()
         self._features_rest = features[:,:,1:].transpose(1, 2).contiguous()
-        self._features_dc.retain_grad()
-        self._features_rest.retain_grad()
+        # self._features_dc.retain_grad()
+        # self._features_rest.retain_grad()
 
         self._scaling = self.scaling_inverse_activation(color_output['scale'] * self.surface_triangle_circle_radius)
  
@@ -296,10 +332,11 @@ class MeshGaussiansField(Field):
  
         self._opacity = self.inverse_opacity_activation(opacity.reshape(-1, 1))
 
-        print ("opacity", self.get_opacity)
-        print ("rotation", self.get_rotation)
-        print ("scale", self.get_scaling)
-        print ("color output", color_output['color'])
+        
+        # print ("opacity", self.get_opacity)
+        # print ("rotation", self.get_rotation)
+        # print ("scale", self.get_scaling)
+        # print ("color output", color_output['color'])
 
 
 
@@ -338,11 +375,11 @@ class MeshGaussiansField(Field):
         return self._xyz.shape[0]
     
     def get_covariance(self, scaling_modifier = 1):
-        print ('get_covariance')
-        print (self.get_scaling)
-        print (self.get_scaling.shape)
+        # print ('get_covariance')
+        # print (self.get_scaling)
+        # print (self.get_scaling.shape)
         
-        print (self._rotation.shape)
+        # print (self._rotation.shape)
         return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
 
     def oneupSHdegree(self):

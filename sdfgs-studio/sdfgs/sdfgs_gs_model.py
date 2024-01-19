@@ -34,6 +34,12 @@ from torchmetrics.functional import structural_similarity_index_measure
 from torchmetrics.image import PeakSignalNoiseRatio
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
+from gsplat._torch_impl import quat_to_rotmat
+from gsplat.compute_cumulative_intersects import compute_cumulative_intersects
+from gsplat.project_gaussians import ProjectGaussians
+from gsplat.rasterize import RasterizeGaussians
+from gsplat.sh import SphericalHarmonics, num_sh_bases
+
 
 def projection_matrix(znear, zfar, fovx, fovy, device: Union[str, torch.device] = "cpu"):
     """
@@ -54,6 +60,43 @@ def projection_matrix(znear, zfar, fovx, fovy, device: Union[str, torch.device] 
         ],
         device=device,
     )
+
+def parse_camera_info_(camera: Cameras, device):
+    # shift the camera to center of scene looking at center
+    R = camera.camera_to_worlds[0, :3, :3]  # 3 x 3
+    T = camera.camera_to_worlds[0, :3, 3:4]  # 3 x 1
+    # flip the z and y axes to align with gsplat conventions
+    R_edit = torch.diag(torch.tensor([1, -1, -1], device=device, dtype=R.dtype))
+    R = R @ R_edit
+    # analytic matrix inverse to get world2camera matrix
+    R_inv = R.T
+    T_inv = -R_inv @ T
+    viewmat = torch.eye(4, device=R.device, dtype=R.dtype)
+    viewmat[:3, :3] = R_inv
+    viewmat[:3, 3:4] = T_inv
+
+    # calculate the FOV of the camera given fx and fy, width and height
+    cx = camera.cx.item()
+    cy = camera.cy.item()
+    fovx = 2 * math.atan(camera.width / (2 * camera.fx))
+    fovy = 2 * math.atan(camera.height / (2 * camera.fy))
+    W, H = camera.width.item(), camera.height.item()
+
+    projmat = projection_matrix(0.001, 1000, fovx, fovy, device=device)
+
+    gs_cam_info = GSCameraInfo(
+            FoVx=fovx,
+            FoVy=fovy,
+            image_height=camera.height.item(),
+            image_width=camera.width.item(),
+            world_view_transform=viewmat.squeeze()[:3, :],
+            full_proj_transform=projmat.squeeze() @ viewmat.squeeze(),
+            camera_center=camera.camera_to_worlds.detach()[..., :3, 3]
+        )    
+
+    return gs_cam_info
+
+
 
 def parse_camera_info(camera: Cameras, device):
     """
@@ -163,23 +206,88 @@ class SDFGSGaussianModel(Model):
         param_groups["field_gs"] = list(self.field.parameters())
         return param_groups
 
+    def render(self, cam : Cameras, gs_cam_info : GSCameraInfo, gs : MeshGaussiansField, background_color : torch.Tensor):
+        W, H = gs_cam_info.image_width, gs_cam_info.image_height
+        BLOCK_X, BLOCK_Y = 16, 16
+        tile_bounds = (
+            (W + BLOCK_X - 1) // BLOCK_X,
+            (H + BLOCK_Y - 1) // BLOCK_Y,
+            1,
+        )
 
+        xys, depths, self.radii, conics, num_tiles_hit, cov3d = ProjectGaussians.apply(
+            gs.get_xyz,
+            gs.get_scaling,
+            1,
+            gs.get_rotation,
+            gs_cam_info.world_view_transform,
+            gs_cam_info.full_proj_transform,
+            cam.fx.item(),
+            cam.fy.item(),
+            cam.cx.item(),
+            cam.cy.item(),
+            H,
+            W,
+            tile_bounds,
+        )  # type: ignore
+
+        if self.training:
+            xys.retain_grad()
+
+        # avoid empty rasterization
+        num_intersects, _ = compute_cumulative_intersects(xys.size(0), num_tiles_hit)
+        assert num_intersects > 0
+
+        rgb = RasterizeGaussians.apply(
+            xys,
+            depths,
+            self.radii,
+            conics,
+            num_tiles_hit,
+            gs.get_features[:, 0, :],
+            gs.get_opacity,
+            H,
+            W,
+            background_color,
+        )  # type: ignore
+        rgb = torch.clamp(rgb, max=1.0)  # type: ignore
+        depth_im = None
+        if not self.training:
+            depth_im = RasterizeGaussians.apply(  # type: ignore
+                xys,
+                depths,
+                self.radii,
+                conics,
+                num_tiles_hit,
+                depths[:, None].repeat(1, 3),
+                gs.get_opacity,
+                H,
+                W,
+                torch.ones(3, device=self.device) * 10,
+            )[
+                ..., 0:1
+            ]  # type: ignore
+
+        return {"rgb": rgb, "depth": depth_im}  # type: ignore
+
+    
     def get_outputs(self, view_camera: Cameras, sdf_network : ImplicitNetworkGrid, shared_color_network : RenderingNetwork) -> Dict[str, Union[torch.Tensor, List]]:
         if not isinstance(view_camera, Cameras):
             print("Called get_outputs with not a camera")
             return {}
         assert view_camera.shape[0] == 1, "Only one camera at a time"
 
-        gs_camera_info = parse_camera_info(view_camera, self.device)
+        gs_camera_info = parse_camera_info_(view_camera, self.device)
 
         self.field.update_gaussians(gs_camera_info.camera_center, sdf_network, shared_color_network)
 
-        render_pkg = self.renderer.render(gs_camera_info, self.field, self.background_color)
+        # render_pkg = self.renderer.render(gs_camera_info, self.field, self.background_color)
+        render_pkg = self.render(view_camera, gs_camera_info, self.field, self.background_color)
 
         # image, depth, viewspace_point_tensor, visibility_filter, radii = \
         #     render_pkg["image"], render_pkg["depth"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
-        return {"rgb": render_pkg["image"], "depth": render_pkg["depth"]}
+        return {"rgb": render_pkg["rgb"], "depth": render_pkg["depth"]}
 
     def forward(self, view_camera: Cameras, sdf_network : ImplicitNetworkGrid, shared_color_network : RenderingNetwork):
         return self.get_outputs(view_camera, sdf_network, shared_color_network)

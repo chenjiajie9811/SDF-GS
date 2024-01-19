@@ -170,19 +170,20 @@ class SDFGSPipeline(Pipeline):
             step: current iteration step
         """
         self.eval()
-        ray_bundle, ray_batch, camera, cam_batch = self.datamanager.next_eval(step)
-        sdf_model_outputs = self.sdf_model.get_outputs_for_camera(ray_bundle)  
+        camera, batch = self.datamanager.next_eval_image(step)
+        sdf_model_outputs = self.sdf_model.get_outputs_for_camera(camera)  
         gs_model_outputs = self._gs_model.get_outputs_for_camera(camera, self._sdf_model.get_sdf_network(), self._sdf_model.get_shared_color_network())
 
         
-        sdf_metrics_dict, sdf_images_dict = self.sdf_model.get_image_metrics_and_images(sdf_model_outputs, ray_batch)
-        gs_metrics_dict, gs_images_dict = self.gs_model.get_image_metrics_and_images(gs_model_outputs, cam_batch)
+        sdf_metrics_dict, sdf_images_dict = self.sdf_model.get_image_metrics_and_images(sdf_model_outputs, batch)
+        gs_metrics_dict, gs_images_dict = self.gs_model.get_image_metrics_and_images(gs_model_outputs, batch)
         # assert "num_rays" not in metrics_dict
-        # metrics_dict["num_rays"] = (camera.height * camera.width * camera.size).item()
+        
         self.train()
 
         metrics_dict = {**sdf_metrics_dict, **gs_metrics_dict}
         images_dict = {**sdf_images_dict, **gs_images_dict}
+        metrics_dict["num_rays"] = (camera.height * camera.width * camera.size).item()
         return metrics_dict, images_dict
 
     @profiler.time_function

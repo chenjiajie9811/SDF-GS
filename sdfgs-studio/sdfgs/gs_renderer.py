@@ -95,6 +95,10 @@ class GaussianRenderer:
             scales = pc.get_scaling
             rotations = pc.get_rotation
 
+        scales = pc.get_scaling
+        rotations = pc.get_rotation
+        cov3D_precomp = None
+
         # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors
         # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.
         shs = None
