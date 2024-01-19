@@ -296,6 +296,8 @@ class SDFGSField(Field):
             n_layers=self.config.num_layers_color,
             multires_view=4
         )
+    
+    
 
     def get_sdf(self, ray_samples: RaySamples) -> Float[Tensor, "num_samples ... 1"]:
         """predict the sdf value for ray samples"""

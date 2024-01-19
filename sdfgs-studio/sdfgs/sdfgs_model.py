@@ -7,10 +7,8 @@ import torch.nn.functional as F
 from dataclasses import dataclass, field
 from typing import Type, Literal, Tuple, Dict, List, cast
 
-from sdfgs.sdfgs_field import SDFGSField, SDFGSFieldConfig
+from sdfgs.sdfgs_field import SDFGSField, SDFGSFieldConfig, ImplicitNetworkGrid
 
-from nerfstudio.models.nerfacto import NerfactoModel, NerfactoModelConfig  # for subclassing Nerfacto model
-from nerfstudio.models.neus import NeuSModel, NeuSModelConfig
 from nerfstudio.models.base_model import Model, ModelConfig  # for custom Model
 
 from nerfstudio.cameras.rays import RayBundle
@@ -36,6 +34,8 @@ from nerfstudio.model_components.losses import L1Loss, MSELoss
 from torchmetrics.functional import structural_similarity_index_measure
 from torchmetrics.image import PeakSignalNoiseRatio
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
+
+from sdfgs.sdfgs_gs_field import RenderingNetwork
 
 
 @dataclass
@@ -91,7 +91,7 @@ class SDFGSModel(Model):
 
         self.scene_contraction = SceneContraction(order=float("inf"))
 
-        self.field = self.config.sdf_field.setup()
+        self.field : SDFGSField = self.config.sdf_field.setup()
 
         if self.config.background_model == "grid":
             raise NotImplementedError
@@ -146,10 +146,16 @@ class SDFGSModel(Model):
         self.ssim = structural_similarity_index_measure
         self.lpips = LearnedPerceptualImagePatchSimilarity()
 
+    def get_shared_color_network(self) -> RenderingNetwork:
+        return self.field.shared_color_network
+
+    def get_sdf_network(self) -> ImplicitNetworkGrid:
+        return self.field.sdf_network
+
     def get_param_groups(self) -> Dict[str, List[nn.Parameter]]:
         param_groups = {}
-        param_groups["fields"] = list(self.field.parameters())
-        param_groups["field_background"] = (
+        param_groups["field_sdf"] = list(self.field.parameters())
+        param_groups["field_sdf_background"] = (
             [self.field_background]
             if isinstance(self.field_background, nn.Parameter)
             else list(self.field_background.parameters())
@@ -279,17 +285,17 @@ class SDFGSModel(Model):
             pred_accumulation=outputs["accumulation"],
             gt_image=image,
         )
-        loss_dict["rgb_loss"] = self.rgb_loss(image, pred_image)
+        loss_dict["rgb_loss_sdf"] = self.rgb_loss(image, pred_image)
         if self.training:
             # eikonal loss
             grad_theta = outputs["eik_grad"]
-            loss_dict["eikonal_loss"] = ((grad_theta.norm(2, dim=-1) - 1) ** 2).mean() * self.config.eikonal_loss_mult
+            loss_dict["eikonal_loss_sdf"] = ((grad_theta.norm(2, dim=-1) - 1) ** 2).mean() * self.config.eikonal_loss_mult
 
             # foreground mask loss
             if "fg_mask" in batch and self.config.fg_mask_loss_mult > 0.0:
                 fg_label = batch["fg_mask"].float().to(self.device)
                 weights_sum = outputs["weights"].sum(dim=1).clip(1e-3, 1.0 - 1e-3)
-                loss_dict["fg_mask_loss"] = (
+                loss_dict["fg_mask_loss_sdf"] = (
                     F.binary_cross_entropy(weights_sum, fg_label) * self.config.fg_mask_loss_mult
                 )
 
@@ -305,7 +311,7 @@ class SDFGSModel(Model):
         metrics_dict = {}
         image = batch["image"].to(self.device)
         image = self.renderer_rgb.blend_background(image)
-        metrics_dict["psnr"] = self.psnr(outputs["rgb"], image)
+        metrics_dict["psnr_sdf"] = self.psnr(outputs["rgb"], image)
         return metrics_dict
 
     def get_image_metrics_and_images(
@@ -355,10 +361,10 @@ class SDFGSModel(Model):
             combined_normal = torch.cat([normal], dim=1)
 
         images_dict = {
-            "img": combined_rgb,
-            "accumulation": combined_acc,
-            "depth": combined_depth,
-            "normal": combined_normal,
+            "img_sdf": combined_rgb,
+            "accumulation_sdf": combined_acc,
+            "depth_sdf": combined_depth,
+            "normal_sdf": combined_normal,
         }
 
         # Switch images from [H, W, C] to [1, C, H, W] for metrics computations
@@ -370,7 +376,7 @@ class SDFGSModel(Model):
         lpips = self.lpips(image, rgb)
 
         # all of these metrics will be logged as scalars
-        metrics_dict = {"psnr": float(psnr.item()), "ssim": float(ssim)}  # type: ignore
-        metrics_dict["lpips"] = float(lpips)
+        metrics_dict = {"psnr_sdf": float(psnr.item()), "ssim_sdf": float(ssim)}  # type: ignore
+        metrics_dict["lpips_sdf"] = float(lpips)
 
         return metrics_dict, images_dict

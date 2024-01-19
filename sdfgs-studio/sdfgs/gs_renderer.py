@@ -2,7 +2,7 @@ import os
 import math
 import torch
 from dataclasses import dataclass
-from sdfgs.sdfgs_field import MeshGaussiansField
+from sdfgs.sdfgs_gs_field import MeshGaussiansField
 from utils.sh_utils import eval_sh
 
 from diff_gaussian_rasterization_w_depth import (
@@ -110,6 +110,18 @@ class GaussianRenderer:
                 shs = pc.get_features
         else:
             colors_precomp = self.override_color
+
+        print ("inside renderer")
+        print ("in scale", scales)
+        print ("in rotation", rotations)
+        print ("self.compute_cov3D_python", self.compute_cov3D_python)
+        print ("cov", cov3D_precomp)
+        print ("opacity", pc.get_opacity)
+        print ("rotation", pc.get_rotation)
+        print ("scale", pc.get_scaling)
+        # print ("color output", color_output['color'])
+
+        
         
         # Rasterize visible Gaussians to image, obtain their radii (on screen).
         rendered_image, radii, rendered_depth = rasterizer(

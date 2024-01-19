@@ -13,7 +13,7 @@ from sdfgs.sdfgs_gs_field import RenderingNetwork, MeshGaussiansField, MeshGauss
 from sdfgs.gs_renderer import GSCameraInfo, GaussianRenderer
 
 from nerfstudio.models.base_model import Model, ModelConfig  # for custom Model
-
+from nerfstudio.data.scene_box import SceneBox
 from nerfstudio.cameras.rays import RayBundle
 from nerfstudio.engine.callbacks import (
     TrainingCallback,
@@ -114,7 +114,7 @@ class SDFGSGaussianModelConfig(ModelConfig):
 
     ssim_lambda: float = 0.2
 
-    use_scale_regularization: bool = False
+    use_scale_regularization: bool = True
     """If enabled, a scale regularization introduced in PhysGauss (https://xpandora.github.io/PhysGaussian/) is used for reducing huge spikey gaussians."""
     
     max_gauss_ratio: float = 10.0
@@ -133,10 +133,12 @@ class SDFGSGaussianModel(Model):
 
         # background
         bg_color = [1, 1, 1] if self.config.white_background else [0, 0, 0]
-        self.background_color = torch.tensor(bg_color, dtype=torch.float32, device=self.device)
+        self.background_color = torch.tensor(bg_color, dtype=torch.float32).cuda()
 
         # field
-        self.field : MeshGaussiansField = self.config.gs_field.setup()
+        self.field : MeshGaussiansField = self.config.gs_field.setup(
+            sh_degree=self.config.sh_degree,
+        )
 
         # renderer
         self.renderer = GaussianRenderer()
@@ -158,11 +160,11 @@ class SDFGSGaussianModel(Model):
 
     def get_param_groups(self) -> Dict[str, List[nn.Parameter]]:
         param_groups = {}
-        param_groups["fields"] = list(self.field.parameters())
+        param_groups["field_gs"] = list(self.field.parameters())
         return param_groups
 
 
-    def get_outputs(self, view_camera: Cameras, sdf_network : ImplicitNetworkGrid) -> Dict[str, Union[torch.Tensor, List]]:
+    def get_outputs(self, view_camera: Cameras, sdf_network : ImplicitNetworkGrid, shared_color_network : RenderingNetwork) -> Dict[str, Union[torch.Tensor, List]]:
         if not isinstance(view_camera, Cameras):
             print("Called get_outputs with not a camera")
             return {}
@@ -170,7 +172,7 @@ class SDFGSGaussianModel(Model):
 
         gs_camera_info = parse_camera_info(view_camera, self.device)
 
-        self.field.update_gaussians(gs_camera_info.camera_center, sdf_network)
+        self.field.update_gaussians(gs_camera_info.camera_center, sdf_network, shared_color_network)
 
         render_pkg = self.renderer.render(gs_camera_info, self.field, self.background_color)
 
@@ -178,6 +180,9 @@ class SDFGSGaussianModel(Model):
         #     render_pkg["image"], render_pkg["depth"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
         return {"rgb": render_pkg["image"], "depth": render_pkg["depth"]}
+
+    def forward(self, view_camera: Cameras, sdf_network : ImplicitNetworkGrid, shared_color_network : RenderingNetwork):
+        return self.get_outputs(view_camera, sdf_network, shared_color_network)
 
     def get_metrics_dict(self, outputs, batch) -> Dict[str, torch.Tensor]:
         """Compute and returns metrics.
@@ -195,7 +200,7 @@ class SDFGSGaussianModel(Model):
         metrics_dict = {}
         gt_rgb = gt_img.to(self.device)  # RGB or RGBA image
         predicted_rgb = outputs["rgb"]
-        metrics_dict["psnr"] = self.psnr(predicted_rgb, gt_rgb)
+        metrics_dict["psnr_gs"] = self.psnr(predicted_rgb, gt_rgb)
 
         # self.camera_optimizer.get_metrics_dict(metrics_dict)
         metrics_dict["gaussian_count"] = self.field.get_num_gaussians
@@ -230,21 +235,21 @@ class SDFGSGaussianModel(Model):
             scale_reg = torch.tensor(0.0).to(self.device)
 
         return {
-            "main_loss": (1 - self.config.ssim_lambda) * Ll1 + self.config.ssim_lambda * simloss,
-            "scale_reg": scale_reg,
+            "main_loss_gs": (1 - self.config.ssim_lambda) * Ll1 + self.config.ssim_lambda * simloss,
+            "scale_reg_gs": scale_reg,
         }
 
     @torch.no_grad()
-    def get_outputs_for_camera(self, camera: Cameras) -> Dict[str, torch.Tensor]:
+    def get_outputs_for_camera(self, view_camera: Cameras, sdf_network : ImplicitNetworkGrid, shared_color_network : RenderingNetwork) -> Dict[str, torch.Tensor]:
         """Takes in a camera, generates the raybundle, and computes the output of the model.
         Overridden for a camera-based gaussian model.
 
         Args:
             camera: generates raybundle
         """
-        assert camera is not None, "must provide camera to gaussian model"
+        assert view_camera is not None, "must provide camera to gaussian model"
         # self.set_crop(obb_box)
-        outs = self.get_outputs(camera.to(self.device))
+        outs = self.get_outputs(view_camera, sdf_network, shared_color_network)
         return outs  # type: ignore
 
     def get_image_metrics_and_images(
@@ -283,9 +288,9 @@ class SDFGSGaussianModel(Model):
         lpips = self.lpips(gt_rgb, predicted_rgb)
 
         # all of these metrics will be logged as scalars
-        metrics_dict = {"psnr": float(psnr.item()), "ssim": float(ssim)}  # type: ignore
-        metrics_dict["lpips"] = float(lpips)
+        metrics_dict = {"psnr_gs": float(psnr.item()), "ssim_gs": float(ssim)}  # type: ignore
+        metrics_dict["lpips_gs"] = float(lpips)
 
-        images_dict = {"img": combined_rgb}
+        images_dict = {"img_gs": combined_rgb}
 
         return metrics_dict, images_dict

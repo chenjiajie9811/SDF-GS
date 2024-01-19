@@ -6,10 +6,13 @@ Define your custom method here that registers with Nerfstudio CLI.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from sdfgs.sdfgs_datamanager import (
     SDFGSDataManagerConfig,
 )
 from sdfgs.sdfgs_model import SDFGSModelConfig
+from sdfgs.sdfgs_gs_model import SDFGSGaussianModelConfig
 from sdfgs.sdfgs_pipeline import (
     SDFGSPipelineConfig,
 )
@@ -36,13 +39,22 @@ SDFGS = MethodSpecification(
         mixed_precision=False,
         pipeline=SDFGSPipelineConfig(
             datamanager=SDFGSDataManagerConfig(
-                dataparser=BlenderDataParserConfig(),
-                train_num_rays_per_batch=4096,
-                eval_num_rays_per_batch=4096,
+                dataparser=BlenderDataParserConfig(
+                    data=Path('/usr/stud/chj/storage/user/chj/datasets/lego')
+                ),
+                train_num_rays_per_batch=512,
+                eval_num_rays_per_batch=512,
             ),
-            model=SDFGSModelConfig(
-                eval_num_rays_per_chunk=1024,
+            # model=SDFGSModelConfig(
+            #     eval_num_rays_per_chunk=1024,
+            # ),
+            model=None,
+            sdf_model=SDFGSModelConfig(
+                eval_num_rays_per_chunk=512,
             ),
+            gs_model=SDFGSGaussianModelConfig(
+
+            )
         ),
         optimizers={
             # TODO: consider changing optimizers depending on your custom method
@@ -50,11 +62,15 @@ SDFGS = MethodSpecification(
             #     "optimizer": AdamOptimizerConfig(lr=1e-2, eps=1e-15),
             #     "scheduler": ExponentialDecaySchedulerConfig(lr_final=0.0001, max_steps=200000),
             # },
-            "fields": {
+            "field_sdf": {
                 "optimizer": AdamOptimizerConfig(lr=5e-4, eps=1e-15),
                 "scheduler": CosineDecaySchedulerConfig(warm_up_end=1000, learning_rate_alpha=0.05, max_steps=200001),
             },
-            "field_background": {
+            "field_sdf_background": {
+                "optimizer": AdamOptimizerConfig(lr=5e-4, eps=1e-15),
+                "scheduler": CosineDecaySchedulerConfig(warm_up_end=1000, learning_rate_alpha=0.05, max_steps=200000),
+            },
+            "field_gs": {
                 "optimizer": AdamOptimizerConfig(lr=5e-4, eps=1e-15),
                 "scheduler": CosineDecaySchedulerConfig(warm_up_end=1000, learning_rate_alpha=0.05, max_steps=200000),
             },
@@ -69,7 +85,7 @@ SDFGS = MethodSpecification(
             # },
         },
         viewer=ViewerConfig(num_rays_per_chunk=1 << 15),
-        vis="viewer",
+        vis="tensorboard",
     ),
     description="SDFGS.",
 )

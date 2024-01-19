@@ -5,15 +5,16 @@ from torch import Tensor
 from jaxtyping import Float
 from sdfgs.embedder import *
 import numpy as np
+from skimage import measure
 
 from dataclasses import dataclass, field
-from typing import Dict, Literal, Optional, Type
+from typing import Dict, Literal, Optional, Type, cast
 
 from sdfgs.embedder import *
 from sdfgs.sdfgs_field import ImplicitNetworkGrid, SDFGSFieldConfig
 
 import trimesh
-from nerfstudio.exporter.marching_cubes import generate_mesh_with_multires_marching_cubes
+from nerfstudio.exporter.marching_cubes import evaluate_sdf
 
 from nerfstudio.cameras.rays import RaySamples
 from nerfstudio.field_components.field_heads import FieldHeadNames
@@ -51,7 +52,7 @@ class RenderingNetwork(nn.Module):
 
         self.num_layers = len(dims)
 
-        for l in range(0, self.num_layers - 1):
+        for l in range(0, self.num_layers - 2):
             out_dim = dims[l + 1]
             lin = nn.Linear(dims[l], out_dim)
 
@@ -62,6 +63,7 @@ class RenderingNetwork(nn.Module):
 
         self.relu = nn.ReLU()
 
+        self.color_lin = nn.Linear(d_hidden, d_out)
         self.scaling_lin = nn.Linear(d_hidden, 3)
         self.rotation_angle_lin = nn.Linear(d_hidden, 1)
 
@@ -74,7 +76,7 @@ class RenderingNetwork(nn.Module):
         
         x = rendering_input
 
-        for l in range(0, self.num_layers - 1):
+        for l in range(0, self.num_layers - 2):
             lin = getattr(self, "lin" + str(l))
 
             x = lin(x)
@@ -82,17 +84,16 @@ class RenderingNetwork(nn.Module):
             if l < self.num_layers - 2:
                 x = self.relu(x)
 
-            if l == self.num_layers - 2:
-                h = x
+        color = self.color_lin(x)
 
         if self.squeeze_out:
-            x = torch.sigmoid(x)
+            color = torch.sigmoid(color)
 
-        ret = {'color' : x}
+        ret = {'color' : color}
 
         if pred_gauss_params:
-            scale = torch.sigmoid(self.scaling_lin(h))
-            rotation_theta = torch.sigmoid(self.rotation_angle_lin(h)) * 2 * torch.pi
+            scale = torch.sigmoid(self.scaling_lin(x))
+            rotation_theta = torch.sigmoid(self.rotation_angle_lin(x)) * 2 * torch.pi
 
             ret['scale'] = scale
             ret['rotation_angle'] = rotation_theta 
@@ -104,12 +105,14 @@ class RenderingNetwork(nn.Module):
 @dataclass 
 class MeshGaussiansFieldConfig(SDFGSFieldConfig):
     _target: Type = field(default_factory=lambda: MeshGaussiansField)
+    init_marching_cubes_resolution : int = 128
 
-class MeshGaussiansField(nn.Module):
+class MeshGaussiansField(Field):
 
     def setup_functions(self):
         def build_covariance_from_scaling_rotation(scaling, scaling_modifier, rotation):
-            L = build_scaling_rotation(scaling_modifier * scaling, rotation)
+            # L = build_scaling_rotation(scaling_modifier * scaling, rotation)
+            L = build_scaling_rotation(scaling, rotation)
             actual_covariance = L @ L.transpose(1, 2)
             symm = strip_symmetric(actual_covariance)
             return symm
@@ -127,13 +130,12 @@ class MeshGaussiansField(nn.Module):
         
 
     def __init__(
-        self, sh_degree : int, 
-        config: SDFGSFieldConfig,
-        sdf_network : ImplicitNetworkGrid,
-        shared_color_network : RenderingNetwork,
+        self, 
+        config: MeshGaussiansFieldConfig,
+        sh_degree : int, 
         device='cuda'
     ):
-        super(MeshGaussiansField, self).__init__()
+        super().__init__()
 
         self.config = config
         
@@ -167,10 +169,9 @@ class MeshGaussiansField(nn.Module):
             multires=6
         )
 
-        self.sdf_network = sdf_network
-
         # self.deviation_network = LearnedVariance(init_val=config.beta_init)
-        self.shared_color_network = shared_color_network
+        # self.shared_color_network : RenderingNetwork = None
+        self.init_mc_res = self.config.init_marching_cubes_resolution
 
         # Mesh related
         self.vertices = torch.empty(0)
@@ -181,40 +182,72 @@ class MeshGaussiansField(nn.Module):
         self.surface_triangle_circle_radius = 1. / 2. / np.sqrt(3.)
         self.bary_coords = torch.tensor([[1/3, 1/3, 1/3]], dtype=torch.float32, device=self.device)[..., None]
 
-        # Initialize the Gaussians from sdf network
-        init_mesh = self.marching_cubes(sdf_network, resolution=128)
-        self.update_mesh_info(init_mesh)
+    def reset_mesh(self, sdf_network : ImplicitNetworkGrid, resolution : int = 128):
+        # Reset the Gaussians by the mesh from sdf network
+        # Need to be call at least once after initializing this field
+        v, f, _ = self.marching_cubes(sdf_network, resolution)
+        
+        v = (v / resolution - 0.5) * 2.0 * 1.5
+
+        print ('after marching cubes')
+        print (v.min())
+        print (v.max())
+        self.update_gaussians_center_info(np.ascontiguousarray(v), np.ascontiguousarray(f))
+    
+    def generate_3d_grid(self,
+                         resolution, 
+                         bounding_box_min=(-1.5, -1.5, -1.5), 
+                         bounding_box_max=(1.5, 1.5, 1.5)):
+        # Generate 1D coordinates along each axis
+        x_coords = torch.linspace(bounding_box_min[0], bounding_box_max[0], resolution)
+        y_coords = torch.linspace(bounding_box_min[1], bounding_box_max[1], resolution)
+        z_coords = torch.linspace(bounding_box_min[2], bounding_box_max[2], resolution)
+
+        # Create a 3D grid using meshgrid
+        x, y, z = torch.meshgrid(x_coords, y_coords, z_coords)
+
+        # Reshape the grid coordinates to obtain a list of 3D points
+        coordinates = torch.column_stack((x.ravel(), y.ravel(), z.ravel()))
+
+        return coordinates
     
     @torch.no_grad()
-    def marching_cubes(self, sdf_network : ImplicitNetworkGrid, resolution=128):
-        mesh : trimesh.Trimesh = generate_mesh_with_multires_marching_cubes(
-                                    sdf_network, 
-                                    resolution, 
-                                    bounding_box_min=(-1.5, -1.5, -1.5), 
-                                    bounding_box_max=(1.5, 1.5, 1.5), 
-                                    isosurface_threshold=0)
-        
-        return mesh
-    
-    def update_mesh_info(self, mesh):
-        self.update_gaussians_center_info(mesh.vertices, mesh.faces)
+    def marching_cubes(self, sdf_network : ImplicitNetworkGrid, resolution : int = 128):
+        coords = self.generate_3d_grid(resolution)
+        coords = coords.to(self.device)
+
+        pts_sdf = evaluate_sdf(
+            sdf=lambda x: sdf_network.get_sdf_vals(x).contiguous(),
+            points=coords)
+
+        z = pts_sdf.detach().cpu().numpy().reshape(resolution, resolution, resolution)
+        v, f, n, _ = measure.marching_cubes(volume=z, level=0)
+
+        return v, f, n
+
 
     def update_gaussians_center_info(self, vertices, faces):
+        print (vertices.shape)
+        print (type(vertices))
         self.vertices = torch.tensor(vertices, device=self.device)
         self.faces = torch.tensor(faces, device=self.device)
 
-        self._xyz = 1. / 3. * (self.vertices[:, self.faces[:, 0].flatten()] + \
-                                self.vertices[:, self.faces[:, 1].flatten()] + \
-                                self.vertices[:, self.faces[:, 2].flatten()])      
+        self._xyz = 1. / 3. * (self.vertices[self.faces[:, 0].flatten()] + \
+                                self.vertices[self.faces[:, 1].flatten()] + \
+                                self.vertices[self.faces[:, 2].flatten()])      
 
-        vec1 = self.vertices[:, self.faces[:, 0].flatten()] - self.vertices[:, self.faces[:, 1].flatten()] 
-        vec2 = self.vertices[:, self.faces[:, 0].flatten()] - self.vertices[:, self.faces[:, 2].flatten()] 
+        vec1 = self.vertices[self.faces[:, 0].flatten()] - self.vertices[self.faces[:, 1].flatten()] 
+        vec2 = self.vertices[self.faces[:, 0].flatten()] - self.vertices[self.faces[:, 2].flatten()] 
         cross_pro = torch.cross(vec1, vec2, dim=-1)
         self.center_normal = F.normalize(cross_pro)
 
            
 
-    def update_gaussians(self, camera_center : Tensor, sdf_network : ImplicitNetworkGrid):
+    def update_gaussians(
+            self, 
+            camera_center : Tensor, 
+            sdf_network : ImplicitNetworkGrid,
+            shared_color_network : RenderingNetwork):
         """
             1. Synchronize the mesh by moving the vertices towards the zero level set 
             according to the estimation of the current sdf network
@@ -224,19 +257,28 @@ class MeshGaussiansField(nn.Module):
             5. Set up all the up-to-date Gaussians parameters
         """
         #1.
+        print ("before vertices move")
+        print (self.vertices)
+        
         sdf, _, gradients = sdf_network.get_outputs(self.vertices)
         self.vertices = self.vertices - sdf * F.normalize(gradients, dim=-1)
+
+        print ("after vertice move")
+        print (self.vertices)
 
         #2.
         self.update_gaussians_center_info(self.vertices, self.faces)
 
         #3.
         geo_output = self.geo_network.forward(self._xyz)
-        opacity, geo_feat_vecs = torch.split(geo_output, [1, self.config.geo_feat_dim], dim=-1)
+        opacity = geo_output[:, :1]
+        geo_feat_vecs = geo_output[:, 1:]
+        # opacity, geo_feat_vecs = torch.split(geo_output, [1, self.config.geo_feat_dim], dim=-1)
+        opacity[torch.isnan(opacity)] = 0.
 
         #4. 
         view_dir = F.normalize(self._xyz - camera_center, dim=-1)
-        color_output = self.shared_color_network.forward(self._xyz, self.center_normal, view_dir, geo_feat_vecs, pred_gauss_params=True)
+        color_output = shared_color_network.forward(self._xyz, self.center_normal, view_dir, geo_feat_vecs, pred_gauss_params=True)
 
         #5.
         features = torch.zeros((self._xyz.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().to(self.device)
@@ -247,12 +289,17 @@ class MeshGaussiansField(nn.Module):
         self._features_dc.retain_grad()
         self._features_rest.retain_grad()
 
-        self._scaling = self.scaling_inverse_activation(color_output['scale'])
+        self._scaling = self.scaling_inverse_activation(color_output['scale'] * self.surface_triangle_circle_radius)
  
         rotation_matrix = exp_so3(self.center_normal.squeeze(0), color_output['rotation_angle'].squeeze(0))
         self._rotation = matrix_to_quaternion(rotation_matrix)
  
-        self._opacity = self.inverse_opacity_activation(opacity)
+        self._opacity = self.inverse_opacity_activation(opacity.reshape(-1, 1))
+
+        print ("opacity", self.get_opacity)
+        print ("rotation", self.get_rotation)
+        print ("scale", self.get_scaling)
+        print ("color output", color_output['color'])
 
 
 
@@ -260,7 +307,10 @@ class MeshGaussiansField(nn.Module):
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device=self.device)
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device=self.device)
         
-        
+    @property
+    def get_mc_res(self):
+        return self.init_mc_res
+
     @property
     def get_scaling(self):
         return self.scaling_activation(self._scaling)
@@ -288,31 +338,16 @@ class MeshGaussiansField(nn.Module):
         return self._xyz.shape[0]
     
     def get_covariance(self, scaling_modifier = 1):
+        print ('get_covariance')
+        print (self.get_scaling)
+        print (self.get_scaling.shape)
+        
+        print (self._rotation.shape)
         return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
 
     def oneupSHdegree(self):
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
-
-    def training_setup(self, training_args):
-        self.percent_dense = training_args['percent_dense']
-        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device=self.device)
-        self.denom = torch.zeros((self.get_xyz.shape[0], 1), device=self.device)
-
-        l = [
-            {'params': [self._xyz], 'lr': training_args['position_lr_init'] * self.spatial_lr_scale, "name": "xyz"},
-            {'params': [self._features_dc], 'lr': training_args['feature_lr'], "name": "f_dc"},
-            {'params': [self._features_rest], 'lr': training_args['feature_lr'] / 20.0, "name": "f_rest"},
-            {'params': [self._opacity], 'lr': training_args['opacity_lr'], "name": "opacity"},
-            {'params': [self._scaling], 'lr': training_args['scaling_lr'], "name": "scaling"},
-            {'params': [self._rotation], 'lr': training_args['rotation_lr'], "name": "rotation"}
-        ]
-
-        self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
-        self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args['position_lr_init']*self.spatial_lr_scale,
-                                                    lr_final=training_args['position_lr_final']*self.spatial_lr_scale,
-                                                    lr_delay_mult=training_args['position_lr_delay_mult'],
-                                                    max_steps=training_args['position_lr_max_steps'])
 
     def forward(self, **kwargs):
         pass
