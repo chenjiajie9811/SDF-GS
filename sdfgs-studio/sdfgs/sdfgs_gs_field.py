@@ -214,7 +214,7 @@ class MeshGaussiansField(Field):
         self.center_normal = torch.empty(0)
 
         # From SuGar
-        self.surface_triangle_circle_radius = 1. / 2. / np.sqrt(3.)
+        self.surface_triangle_circle_radius = 0.05 #1. / 2. / np.sqrt(3.)
         self.bary_coords = torch.tensor([[1/3, 1/3, 1/3]], dtype=torch.float32, device=self.device)[..., None]
 
     def reset_mesh(self, sdf_network : ImplicitNetworkGrid, resolution : int = 128):
@@ -223,11 +223,17 @@ class MeshGaussiansField(Field):
         v, f, _ = self.marching_cubes(sdf_network, resolution)
         
         v = (v / resolution - 0.5) * 2.0 * 1.5
-
-        # print ('after marching cubes')
-        # print (v.min())
-        # print (v.max())
         self.update_gaussians_center_info(np.ascontiguousarray(v), np.ascontiguousarray(f))
+
+    def output_mesh(self, path):
+        if self.vertices.shape[0] > 0 and self.faces.shape[0] > 0:
+            mesh = trimesh.Trimesh(
+                vertices=self.vertices.clone().detach().cpu().numpy(),
+                faces=self.faces.clone().detach().cpu().numpy())
+            
+            mesh.export(path)
+            print ("Saved mesh")
+
     
     def generate_3d_grid(self,
                          resolution, 
@@ -264,8 +270,10 @@ class MeshGaussiansField(Field):
     def update_gaussians_center_info(self, vertices, faces):
         # print (vertices.shape)
         # print (type(vertices))
-        self.vertices = torch.tensor(vertices, device=self.device)
-        self.faces = torch.tensor(faces, device=self.device)
+        self.vertices = torch.tensor(vertices).to(self.device)
+        self.faces = torch.tensor(faces).to(self.device)
+        # self.vertices = torch.from_numpy(vertices.clone().detach()).to(self.device)
+        # self.faces = torch.from_numpy(faces.clone().detach()).to(self.device)
 
         self._xyz = 1. / 3. * (self.vertices[self.faces[:, 0].flatten()] + \
                                 self.vertices[self.faces[:, 1].flatten()] + \
@@ -292,14 +300,8 @@ class MeshGaussiansField(Field):
             5. Set up all the up-to-date Gaussians parameters
         """
         #1.
-        # print ("before vertices move")
-        # print (self.vertices)
-        
         sdf, _, gradients = sdf_network.get_outputs(self.vertices)
         self.vertices = self.vertices - sdf * F.normalize(gradients, dim=-1)
-
-        # print ("after vertice move")
-        # print (self.vertices)
 
         #2.
         self.update_gaussians_center_info(self.vertices, self.faces)

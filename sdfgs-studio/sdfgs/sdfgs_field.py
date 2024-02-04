@@ -24,8 +24,10 @@ from nerfstudio.field_components.field_heads import FieldHeadNames
 from nerfstudio.fields.base_field import Field, FieldConfig  # for custom Field
 from nerfstudio.fields.sdf_field import LearnedVariance
 
+import tinycudann as tcnn
 
-from hashencoder.hashgrid import _hash_encode, HashEncoder
+
+# from hashencoder.hashgrid import _hash_encode, HashEncoder
 class ImplicitNetworkGrid(nn.Module):
     def __init__(
             self,
@@ -47,7 +49,8 @@ class ImplicitNetworkGrid(nn.Module):
             num_levels=16,#16,
             level_dim=2,
             divide_factor = 1.5, # used to normalize the points range for multi-res grid
-            use_grid_feature = True
+            use_grid_feature = True,
+            finite_grad = True
     ):
         super().__init__()
 
@@ -58,15 +61,16 @@ class ImplicitNetworkGrid(nn.Module):
         self.divide_factor = divide_factor
         self.grid_feature_dim = num_levels * level_dim
         self.use_grid_feature = use_grid_feature
+        self.finite_grad = finite_grad
         dims[0] += self.grid_feature_dim
         
         print(f"using hash encoder with {num_levels} levels, each level with feature dim {level_dim}")
         print(f"resolution:{base_size} -> {end_size} with hash map size {logmap}")
-        self.encoding = HashEncoder(input_dim=3, num_levels=num_levels, level_dim=level_dim, 
-                    per_level_scale=2, base_resolution=base_size, 
-                    log2_hashmap_size=logmap, desired_resolution=end_size)
+        # self.encoding = HashEncoder(input_dim=3, num_levels=num_levels, level_dim=level_dim, 
+        #             per_level_scale=2, base_resolution=base_size, 
+        #             log2_hashmap_size=logmap, desired_resolution=end_size)
         
-        '''
+        
         # can also use tcnn for multi-res grid as it now supports eikonal loss
         base_size = 16
         hash = True
@@ -80,7 +84,6 @@ class ImplicitNetworkGrid(nn.Module):
                         "per_level_scale": 1.34,
                         "interpolation": "Smoothstep" if smoothstep else "Linear"
                     })
-        '''
         
         if multires > 0:
             embed_fn, input_ch = get_embedder(multires, input_dims=d_in)
@@ -163,6 +166,34 @@ class ImplicitNetworkGrid(nn.Module):
                 x = self.softplus(x)
 
         return x
+    
+    def finite_difference_normals_approximator(self, x : Tensor, bound=1, epsilon = 0.005, sdf=None):
+        # finite difference
+        # f(x+h, y, z), f(x, y+h, z), f(x, y, z+h) - f(x-h, y, z), f(x, y-h, z), f(x, y, z-h)
+        pos_x = x + torch.tensor([[epsilon, 0.00, 0.00]], device=x.device)
+        dist_dx_pos = self.get_sdf_vals(pos_x.clamp(-bound, bound))
+        # dist_dx_pos = dist_dx_pos[:,None]
+        pos_y = x + torch.tensor([[0.00, epsilon, 0.00]], device=x.device)
+        dist_dy_pos = self.get_sdf_vals(pos_y.clamp(-bound, bound))
+        # dist_dy_pos = dist_dy_pos[:,None]
+        pos_z = x + torch.tensor([[0.00, 0.00, epsilon]], device=x.device)
+        dist_dz_pos= self.get_sdf_vals(pos_z.clamp(-bound, bound))
+        # dist_dz_pos = dist_dz_pos[:,None]
+
+        neg_x = x + torch.tensor([[-epsilon, 0.00, 0.00]], device=x.device)
+        dist_dx_neg = self.get_sdf_vals(neg_x.clamp(-bound, bound))
+        # dist_dx_neg = dist_dx_neg[:,None]
+        neg_y = x + torch.tensor([[0.00, -epsilon, 0.00]], device=x.device)
+        dist_dy_neg = self.get_sdf_vals(neg_y.clamp(-bound, bound))
+        # dist_dy_neg = dist_dy_neg[:,None]
+        neg_z = x + torch.tensor([[0.00, 0.00, -epsilon]], device=x.device)
+        dist_dz_neg = self.get_sdf_vals(neg_z.clamp(-bound, bound))
+        # dist_dz_neg = dist_dz_neg[:,None]
+
+        grad = torch.cat([0.5*(dist_dx_pos - dist_dx_neg) / epsilon, 0.5*(dist_dy_pos - dist_dy_neg) / epsilon, 0.5*(dist_dz_pos - dist_dz_neg) / epsilon], dim=-1)
+    
+        # print (grad.shape)
+        return grad
 
     def gradient(self, x):
         x.requires_grad_(True)
@@ -180,20 +211,26 @@ class ImplicitNetworkGrid(nn.Module):
 
     def get_outputs(self, x):
         
-        x.requires_grad_(True)
-        with torch.enable_grad():
+        if self.finite_grad:
             output = self.forward(x)
             sdf = output[:,:1]
-
             feature_vectors = output[:, 1:]
-            d_output = torch.ones_like(sdf, requires_grad=False, device=sdf.device)
-            gradients = torch.autograd.grad(
-                outputs=sdf,
-                inputs=x,
-                grad_outputs=d_output,
-                create_graph=True,
-                retain_graph=True,
-                only_inputs=True)[0]
+            gradients = self.finite_difference_normals_approximator(x, bound=self.divide_factor)
+        else:
+            x.requires_grad_(True)
+            with torch.enable_grad():
+                output = self.forward(x)
+                sdf = output[:,:1]
+
+                feature_vectors = output[:, 1:]
+                d_output = torch.ones_like(sdf, requires_grad=False, device=sdf.device)
+                gradients = torch.autograd.grad(
+                    outputs=sdf,
+                    inputs=x,
+                    grad_outputs=d_output,
+                    create_graph=True,
+                    retain_graph=True,
+                    only_inputs=True)[0]
 
         return sdf, feature_vectors, gradients
 

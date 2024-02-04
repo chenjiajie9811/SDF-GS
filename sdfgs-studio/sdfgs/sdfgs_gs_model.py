@@ -250,7 +250,7 @@ class SDFGSGaussianModel(Model):
             W,
             background_color,
         )  # type: ignore
-        rgb = torch.clamp(rgb, max=1.0)  # type: ignore
+        rgb = torch.clamp(rgb, min=0.0, max=1.0)  # type: ignore
         depth_im = None
         if not self.training:
             depth_im = RasterizeGaussians.apply(  # type: ignore
