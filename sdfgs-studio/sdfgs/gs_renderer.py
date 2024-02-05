@@ -93,10 +93,10 @@ def generate_neural_gaussians(viewpoint_camera : GSCameraInfo, pc , visible_mask
     if visible_mask is None:
         visible_mask = torch.ones(pc.get_anchor.shape[0], dtype=torch.bool, device = pc.get_anchor.device)
     
-    feat = pc._anchor_feat[visible_mask]
+    # feat = pc._anchor_feat[visible_mask]
     
     anchor = pc.get_anchor[visible_mask]
-    # feat = pc.encoding(anchor)
+    feat = pc.encoding(anchor)
     grid_offsets = pc._offset[visible_mask]
     grid_scaling = pc.get_scaling[visible_mask]
 

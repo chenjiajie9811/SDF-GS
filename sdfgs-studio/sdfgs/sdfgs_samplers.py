@@ -18,6 +18,29 @@ def s_density_func(inv_s, sdf):
     a = torch.exp(-s*sdf)
     b = a + 1
     return s * a / (b + 1) ** 2
+
+def save_points(path_save, pts, colors=None, normals=None, BRG2RGB=False):
+    """save points to point cloud using open3d"""
+    assert len(pts) > 0
+    if colors is not None:
+        assert colors.shape[1] == 3
+    assert pts.shape[1] == 3
+    import numpy as np
+    import open3d as o3d
+
+    cloud = o3d.geometry.PointCloud()
+    cloud.points = o3d.utility.Vector3dVector(pts)
+    if colors is not None:
+        # Open3D assumes the color values are of float type and in range [0, 1]
+        if np.max(colors) > 1:
+            colors = colors / np.max(colors)
+        if BRG2RGB:
+            colors = np.stack([colors[:, 2], colors[:, 1], colors[:, 0]], axis=-1)
+        cloud.colors = o3d.utility.Vector3dVector(colors)
+    if normals is not None:
+        cloud.normals = o3d.utility.Vector3dVector(normals)
+
+    o3d.io.write_point_cloud(path_save, cloud)
  
 class NeuSAccSampler(Sampler):
     def __init__(
@@ -60,78 +83,65 @@ class NeuSAccSampler(Sampler):
         self.neus_sampler = neus_sampler
 
         self.grid = OccGridEstimator(aabb.reshape(-1), resolution=self.resolution, levels=4).train()
-        self.register_buffer("_binary", torch.ones((self.grid_size, self.grid_size, self.grid_size), dtype=torch.bool))
+        # self.register_buffer("_binary", torch.ones((self.grid_size, self.grid_size, self.grid_size), dtype=torch.bool))
         self.register_buffer("_update_counter", torch.zeros(1, dtype=torch.int32))
 
-        self.init_grid_coordinate()
-
-    def init_grid_coordinate(self):
-        # coarse grid coordinates
-        aabb = self.aabb
-        offset_x = torch.linspace(
-            aabb[0, 0] + self.voxel_size / 2.0, aabb[1, 0] - self.voxel_size / 2.0, self.grid_size
-        )
-        offset_y = torch.linspace(
-            aabb[0, 1] + self.voxel_size / 2.0, aabb[1, 1] - self.voxel_size / 2.0, self.grid_size
-        )
-        offset_z = torch.linspace(
-            aabb[0, 2] + self.voxel_size / 2.0, aabb[1, 2] - self.voxel_size / 2.0, self.grid_size
-        )
-        x, y, z = torch.meshgrid(offset_x, offset_y, offset_z, indexing="ij")
-        cube_coordinate = torch.stack([x, y, z], dim=-1).reshape(-1, 3)
-
-        self.register_buffer("cube_coordinate", cube_coordinate)
+        # self.init_grid_coordinate()
 
     def update_step_size(self, step, inv_s=None):
         assert inv_s is not None
         inv_s = inv_s().item()
         self.step_size = 14.0 / inv_s / 16
+        print (f"step{step}: {self.step_size}")
 
     @torch.no_grad()
-    def update_binary_grid(self, step, sdf_fn=None, inv_s=None):
+    def update_binary_grid_w_sdf(self, step, sdf_fn=None, inv_s=None):
         assert sdf_fn is not None
         assert inv_s is not None
-
         if step >= self.steps_warpup and step % self.steps_per_grid_update == 0:
-            mask = self._binary.reshape(-1)
-            occupied_voxel = self.cube_coordinate[mask.reshape(-1)]
+            mask = self.grid.binaries.reshape(-1)
+            occupied_voxel = self.grid.grid_coords[mask]
 
             def evaluate(points):
                 z = []
-                for _, pnts in enumerate(torch.split(points, 100000, dim=0)):
-                    z.append(sdf_fn(pnts))
-                z = torch.cat(z, axis=0)
+                for _, pts in enumerate(torch.split(points, 100000, dim=0)):
+                    z.append(sdf_fn(pts))
+                z = torch.cat(z, dim=0)
                 return z
             
             sdf = evaluate(occupied_voxel)
 
             # use maximum bound for sdf value
-            bound = self.voxel_size * (3**0.5) / 2.0
+            # bound = self.voxel_size * (3**0.5) / 2.0
             sdf = sdf.abs()
-            sdf = torch.maximum(sdf - bound, torch.zeros_like(sdf))
 
-            estimated_next_sdf = sdf - self.step_size * 0.5
-            estimated_prev_sdf = sdf + self.step_size * 0.5
-            inv_s = inv_s()
-            prev_cdf = torch.sigmoid(estimated_prev_sdf * inv_s)
-            next_cdf = torch.sigmoid(estimated_next_sdf * inv_s)
+            sdf_mask = sdf <= 0.05
+            mask[mask.clone()] = sdf_mask
 
-            p = prev_cdf - next_cdf
-            c = prev_cdf
+            self.grid.binaries = mask.reshape([self.grid_size] * 3).contiguous()
 
-            alpha = ((p + 1e-5) / (c + 1e-5)).clip(0.0, 1.0)
-            sdf_mask = alpha > self.alpha_thres
-
-            mask[mask.reshape(-1).clone()] = sdf_mask
-
-            self._binary = mask.reshape([self.grid_size] * 3).contiguous()
-
-            # save_points("voxel_valid.ply", self.cube_coordinate[self._binary.reshape(-1)].cpu().numpy())
-
-            # TODO do we need dilation
-            # F.max_pool3d(M.float(), kernel_size=3, padding=1, stride=1).bool()
-            # save_points("voxel_valid_dilated.ply", self.cube_coordinate[self._binary.reshape(-1)].cpu().numpy())
             self._update_counter += 1
+            print ("update_binary_grid_w_sdf")
+
+    @torch.no_grad()
+    def update_binary_grid_w_points(self, points):
+        # get rid of points outside the aabb cube
+        # points (N, 3)
+        mask = (points[:, 0] >= self.aabb[0, 0]) & (points[:, 0] < self.aabb[1, 0]) &\
+                (points[:, 1] >= self.aabb[0, 1]) & (points[:, 1] < self.aabb[1, 1]) &\
+                (points[:, 2] >= self.aabb[0, 2]) & (points[:, 2] < self.aabb[1, 2])
+        
+        points = points[mask]
+        # shift and rescale to [0, 1]
+        points = points / (self.aabb[0, 1] - self.aabb[0, 0]) + torch.ones_like(points) * 0.5
+        # voxelize the points
+        occ_vox_idx = torch.unique(torch.round(points * self.grid_size), dim=0).long()
+        self.grid.binaries[occ_vox_idx[:, 0], occ_vox_idx[:, 1], occ_vox_idx[:, 2]] = 1
+        #@TODO check bug here!
+        
+        save_points("init_vox.ply", points)
+        print ("update_binary_grid_w_points")
+
 
     def create_ray_samples_from_ray_indices(self, ray_bundle: RayBundle, ray_indices, t_starts, t_ends):
         rays_o = ray_bundle.origins[ray_indices]
@@ -211,6 +221,10 @@ class NeuSAccSampler(Sampler):
         ray_indices = ray_indices.long()
         ray_samples = self.create_ray_samples_from_ray_indices(ray_bundle, ray_indices, t_starts[...,None], t_ends[...,None])
 
+
+        save_points("first.ply", ray_samples.frustums.get_start_positions().cpu().numpy().reshape(-1, 3))
+        print("saved")
+
         # total_iters = 0
         # sorted_index = None
         # sdf: Optional[torch.Tensor] = None
@@ -264,5 +278,5 @@ class NeuSAccSampler(Sampler):
         #     ray_samples = self.create_ray_samples_from_ray_indices(ray_bundle, ray_indices, t_starts, t_ends)
 
             # save_points("second.ply", ray_samples.frustums.get_start_positions().cpu().numpy().reshape(-1, 3))
-        self._update_counter += 1
+        # self._update_counter += 1
         return ray_samples, ray_indices

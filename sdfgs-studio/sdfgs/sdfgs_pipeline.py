@@ -13,7 +13,7 @@ from torch.cuda.amp.grad_scaler import GradScaler
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from sdfgs.sdfgs_datamanager import SDFGSDataManagerConfig
-from sdfgs.sdfgs_model import SDFGSModel, SDFGSModelConfig
+from sdfgs.sdfgs_model import SDFGSModel, SDFGSModelConfig, NeuSAccModel, NeuSAccModelConfig
 from sdfgs.sdfgs_gs_model import SDFGSGaussianModel, SDFGSGaussianModelConfig
 from nerfstudio.data.datamanagers.base_datamanager import (
     DataManager,
@@ -244,40 +244,32 @@ class SDFGSPipeline(Pipeline):
         return {**datamanager_params, **sdf_model_params, **gs_model_params}
     
 
+@dataclass
+class NeuSAccPipelineConfig(VanillaPipelineConfig):
+    """Configuration for pipeline instantiation"""
 
-# class SDFGSPipeline(Pipeline):
+    _target: Type = field(default_factory=lambda: NeuSAccPipeline)
+    """target class to instantiate"""
+    model: ModelConfig = NeuSAccModelConfig()
+
+class NeuSAccPipeline(VanillaPipeline):
 
 
-#     def __init__(
-#         self,
-#         config: SDFGSPipelineConfig,
-#         device: str,
-#         test_mode: Literal["test", "val", "inference"] = "val",
-#         world_size: int = 1,
-#         local_rank: int = 0,
-#         grad_scaler: Optional[GradScaler] = None,
-#     ):
-#         super(VanillaPipeline, self).__init__()
-#         self.config = config
-#         self.test_mode = test_mode
-#         self.datamanager: DataManager = config.datamanager.setup(
-#             device=device, test_mode=test_mode, world_size=world_size, local_rank=local_rank
-#         )
-#         self.datamanager.to(device)
+    def __init__(
+        self,
+        config: NeuSAccPipelineConfig,
+        device: str,
+        test_mode: Literal["test", "val", "inference"] = "val",
+        world_size: int = 1,
+        local_rank: int = 0,
+        grad_scaler: Optional[GradScaler] = None,
+    ):
+        super().__init__(config, device, test_mode, world_size, local_rank)
+        if (
+            hasattr(self.datamanager, "train_dataparser_outputs")
+            and "points3D_xyz" in self.datamanager.train_dataparser_outputs.metadata
+        ):
+            pts = self.datamanager.train_dataparser_outputs.metadata["points3D_xyz"]
+            # pts_rgb = self.datamanager.train_dataparser_outputs.metadata["points3D_rgb"]
 
-#         assert self.datamanager.train_dataset is not None, "Missing input dataset"
-#         self._model = config.model.setup(
-#             scene_box=self.datamanager.train_dataset.scene_box,
-#             num_train_data=len(self.datamanager.train_dataset),
-#             metadata=self.datamanager.train_dataset.metadata,
-#             device=device,
-#             grad_scaler=grad_scaler,
-#         )
-#         self.model.to(device)
-
-#         self.world_size = world_size
-#         if world_size > 1:
-#             self._model = typing.cast(
-#                 SDFGSModel, DDP(self._model, device_ids=[local_rank], find_unused_parameters=True)
-#             )
-#             dist.barrier(device_ids=[local_rank])
+        self.model.sampler.update_binary_grid_w_points(pts)

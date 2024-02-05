@@ -37,6 +37,124 @@ from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
 from sdfgs.sdfgs_gs_field import RenderingNetwork
 
+from sdfgs.sdfgs_samplers import NeuSAccSampler
+from nerfstudio.models.neus import NeuSModel, NeuSModelConfig
+
+import nerfacc
+
+@dataclass
+class NeuSAccModelConfig(NeuSModelConfig):
+
+    _target: Type = field(default_factory=lambda: NeuSAccModel)
+    sky_loss_mult: float = 0.01
+    """Sky segmentation normal consistency loss multiplier."""
+
+class NeuSAccModel(NeuSModel):
+
+
+    config: NeuSAccModelConfig
+
+    def populate_modules(self):
+        """Set the fields and modules."""
+        super().populate_modules()
+
+        self.sampler = NeuSAccSampler(aabb=self.scene_box.aabb, neus_sampler=self.sampler)
+
+    def get_training_callbacks(
+        self, training_callback_attributes: TrainingCallbackAttributes
+    ) -> List[TrainingCallback]:
+        callbacks = super().get_training_callbacks(training_callback_attributes)
+
+        # add sampler call backs
+        sdf_fn = lambda x: self.field.forward_geonetwork(x)[:, 0].contiguous()
+        inv_s = self.field.deviation_network.get_variance
+        callbacks.append(
+            TrainingCallback(
+                where_to_run=[TrainingCallbackLocation.AFTER_TRAIN_ITERATION],
+                update_every_num_iters=1,
+                func=self.sampler.update_binary_grid_w_sdf,
+                kwargs={"sdf_fn": sdf_fn, "inv_s": inv_s},
+            )
+        )
+
+        callbacks.append(
+            TrainingCallback(
+                where_to_run=[TrainingCallbackLocation.BEFORE_TRAIN_ITERATION],
+                update_every_num_iters=1,
+                func=self.sampler.update_step_size,
+                kwargs={"inv_s": inv_s},
+            )
+        )
+
+        return callbacks
+
+    def get_outputs(self, ray_bundle: RayBundle):
+        # bootstrap with original Neus
+        # if self.sampler._update_counter.item() <= 0:
+        #     return super().get_outputs(ray_bundle)
+
+        ray_samples, ray_indices = self.sampler(ray_bundle, sdf_fn=self.field.get_sdf, alpha_fn=self.field.get_alpha, neus_fields=self.field)
+
+        if ray_samples.shape[0] > 0:
+            field_outputs = self.field(ray_samples, return_alphas=True)
+
+            
+            n_rays = ray_bundle.shape[0] 
+            weights, _ = nerfacc.render_weight_from_alpha(
+                field_outputs[FieldHeadNames.ALPHA].reshape(-1),
+                ray_indices=ray_indices,
+                n_rays=n_rays,
+            )
+            
+            rgb = nerfacc.accumulate_along_rays(
+                weights=weights, ray_indices=ray_indices, values=field_outputs[FieldHeadNames.RGB], n_rays=n_rays
+            )
+            normal = nerfacc.accumulate_along_rays(
+                weights=weights, ray_indices=ray_indices, values=field_outputs[FieldHeadNames.NORMALS], n_rays=n_rays
+            )
+
+            accumulation = nerfacc.accumulate_along_rays(weights=weights, ray_indices=ray_indices, values=None, n_rays=n_rays)
+            depth = nerfacc.accumulate_along_rays(
+                weights=weights,
+                ray_indices=ray_indices,
+                values=(ray_samples.frustums.starts + ray_samples.frustums.ends) / 2,
+                n_rays=n_rays,
+            )
+
+            # the rendered depth is point-to-point distance and we should convert to depth
+            depth = depth / ray_bundle.metadata["directions_norm"]
+
+            outputs = {
+                "rgb": rgb,
+                "accumulation": accumulation,
+                "depth": depth,
+                "normal": normal,
+            }
+
+            if self.training:
+                grad_points = field_outputs[FieldHeadNames.GRADIENT]
+                outputs.update({"eik_grad": grad_points})
+        else:
+            zeros = torch.zeros((ray_bundle.shape[0], 3), dtype=torch.float32, device=self.device)
+            outputs = {"rgb": zeros, "accumulation": zeros[:, :1], "depth": zeros[:, :1], "normal": zeros}
+            if self.training:
+                outputs.update({"eik_grad": zeros})
+
+        # this is used only in viewer
+        outputs["normal_vis"] = (outputs["normal"] + 1.0) / 2.0
+        return outputs
+    def get_image_metrics_and_images(
+        self, outputs: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor]
+    ) -> Tuple[Dict[str, float], Dict[str, torch.Tensor]]:
+        metrics_dict, images_dict = super().get_image_metrics_and_images(outputs, batch)
+        # images_dict.update({"img_bg" : outputs['bg_rgb']})
+
+        return metrics_dict, images_dict
+
+    # def get_metrics_dict(self, outputs, batch):
+    #     metrics = super().get_metrics_dict(outputs, batch)
+    #     metrics["acc_step_size"] = self.sampler.step_size
+    #     return metrics
 
 @dataclass
 class SDFGSModelConfig(ModelConfig):
@@ -362,6 +480,7 @@ class SDFGSModel(Model):
 
         images_dict = {
             "img_sdf": combined_rgb,
+            "img_bg_sdf" : outputs['bg_rgb'],
             "accumulation_sdf": combined_acc,
             "depth_sdf": combined_depth,
             "normal_sdf": combined_normal,
