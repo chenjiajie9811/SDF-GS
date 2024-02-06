@@ -49,6 +49,11 @@ class NeuSAccModelConfig(NeuSModelConfig):
     sky_loss_mult: float = 0.01
     """Sky segmentation normal consistency loss multiplier."""
 
+    # neusacc sampler related
+    steps_warpup:int = 100
+    steps_per_grid_update:int = 200
+
+
 class NeuSAccModel(NeuSModel):
 
 
@@ -58,7 +63,12 @@ class NeuSAccModel(NeuSModel):
         """Set the fields and modules."""
         super().populate_modules()
 
-        self.sampler = NeuSAccSampler(aabb=self.scene_box.aabb, neus_sampler=self.sampler)
+        self.sampler = NeuSAccSampler(
+            aabb=self.scene_box.aabb, 
+            neus_sampler=self.sampler,
+            steps_warpup=self.config.steps_warpup,
+            steps_per_grid_update=self.config.steps_per_grid_update,
+            )
 
     def get_training_callbacks(
         self, training_callback_attributes: TrainingCallbackAttributes
@@ -70,7 +80,7 @@ class NeuSAccModel(NeuSModel):
         inv_s = self.field.deviation_network.get_variance
         callbacks.append(
             TrainingCallback(
-                where_to_run=[TrainingCallbackLocation.AFTER_TRAIN_ITERATION],
+                where_to_run=[TrainingCallbackLocation.BEFORE_TRAIN_ITERATION],
                 update_every_num_iters=1,
                 func=self.sampler.update_binary_grid_w_sdf,
                 kwargs={"sdf_fn": sdf_fn, "inv_s": inv_s},
@@ -90,16 +100,21 @@ class NeuSAccModel(NeuSModel):
 
     def get_outputs(self, ray_bundle: RayBundle):
         # bootstrap with original Neus
-        # if self.sampler._update_counter.item() <= 0:
-        #     return super().get_outputs(ray_bundle)
+        if self.sampler._update_counter.item() <= 0:
+            return super().get_outputs(ray_bundle)
 
         ray_samples, ray_indices = self.sampler(ray_bundle, sdf_fn=self.field.get_sdf, alpha_fn=self.field.get_alpha, neus_fields=self.field)
 
         if ray_samples.shape[0] > 0:
+            # !!!!!!!!!!!!! Problem here! the ray samples are not in the form of (n_ray, n_sample_per_ray)
+            # in the get_alpha function from the sdf field it can not handle the case when the ray sample with
+            # shape (n_sample,) and given ray_indices with shape (n_sample)
+            #@TODO need to find a way to sample a fixed number of samples from each ray given the occupied voxels
             field_outputs = self.field(ray_samples, return_alphas=True)
 
             
             n_rays = ray_bundle.shape[0] 
+
             weights, _ = nerfacc.render_weight_from_alpha(
                 field_outputs[FieldHeadNames.ALPHA].reshape(-1),
                 ray_indices=ray_indices,
@@ -143,6 +158,8 @@ class NeuSAccModel(NeuSModel):
         # this is used only in viewer
         outputs["normal_vis"] = (outputs["normal"] + 1.0) / 2.0
         return outputs
+    
+
     def get_image_metrics_and_images(
         self, outputs: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor]
     ) -> Tuple[Dict[str, float], Dict[str, torch.Tensor]]:

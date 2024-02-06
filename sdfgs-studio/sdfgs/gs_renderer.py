@@ -96,7 +96,7 @@ def generate_neural_gaussians(viewpoint_camera : GSCameraInfo, pc , visible_mask
     # feat = pc._anchor_feat[visible_mask]
     
     anchor = pc.get_anchor[visible_mask]
-    feat = pc.encoding(anchor)
+    feat = pc.encod_input(anchor)
     grid_offsets = pc._offset[visible_mask]
     grid_scaling = pc.get_scaling[visible_mask]
 

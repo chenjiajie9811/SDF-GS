@@ -10,12 +10,15 @@
 #
 
 import torch
+from torch import Tensor
 from functools import reduce
 import numpy as np
 from torch_scatter import scatter_max
+import torch.nn.functional as F
 
 from dataclasses import dataclass, field
-from typing import Type, Literal, Tuple, Union, Dict, List, cast
+from typing import Type, Literal, Tuple, Union, Dict, List, cast, Optional
+from jaxtyping import Float
 
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func
 from torch import nn
@@ -29,11 +32,15 @@ from utils.general_utils import strip_symmetric, build_scaling_rotation
 
 from sdfgs.gs_renderer import GaussianRenderer, parse_camera_info
 
+from nerfstudio.cameras.rays import RaySamples, RayBundle
 from nerfstudio.models.base_model import Model, ModelConfig  # for custom Model
 from nerfstudio.cameras.cameras import Cameras
 from nerfstudio.engine.callbacks import TrainingCallback, TrainingCallbackAttributes, TrainingCallbackLocation
-from nerfstudio.field_components.encodings import TriplaneEncoding, TensorVMEncoding, HashEncoding
+from nerfstudio.field_components.encodings import NeRFEncoding, TriplaneEncoding, TensorVMEncoding, HashEncoding
 from nerfstudio.data.scene_box import SceneBox
+from nerfstudio.fields.sdf_field import LearnedVariance
+from nerfstudio.field_components.field_heads import FieldHeadNames
+from nerfstudio.model_components.ray_samplers import NeuSSampler
 
 from nerfstudio.model_components.losses import L1Loss, MSELoss
 from pytorch_msssim import SSIM
@@ -41,7 +48,329 @@ from torchmetrics.functional import structural_similarity_index_measure
 from torchmetrics.image import PeakSignalNoiseRatio
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
+from nerfstudio.model_components.renderers import AccumulationRenderer, DepthRenderer, RGBRenderer, SemanticRenderer
+
 import tinycudann as tcnn
+
+
+@dataclass 
+class ScaffoldGSNeusFieldConfig:
+    # neus related
+    num_layers: int = 2
+    """Number of layers for geometric network"""
+    hidden_dim: int = 64
+    """Number of hidden dimension of geometric network"""
+    geo_feat_dim: int = 31
+    """Dimension of geometric feature"""
+    num_layers_color: int = 4
+    """Number of layers for color network"""
+    hidden_dim_color: int = 64
+    """Number of hidden dimension of color network"""
+    bias: float = 0.8
+    """Sphere size of geometric initialization"""
+    geometric_init: bool = True
+    """Whether to use geometric initialization"""
+    inside_outside: bool = True
+    """Whether to revert signed distance value, set to True for indoor scene"""
+    weight_norm: bool = True
+    """Whether to use weight norm for linear layer"""
+    beta_init: float = 0.3
+
+class ScaffoldGSNeusField(nn.Module):
+    def __init__(self, config:ScaffoldGSNeusFieldConfig):
+        super().__init__()
+        self.config = config
+        self.encoding_dim = 32
+
+        # we concat inputs position ourselves
+        self.position_encoding = NeRFEncoding(
+            in_dim=3, num_frequencies=6, min_freq_exp=0.0, max_freq_exp=5.0, include_input=False
+        )
+
+        self.direction_encoding = NeRFEncoding(
+            in_dim=3, num_frequencies=4, min_freq_exp=0.0, max_freq_exp=3.0, include_input=True
+        )
+
+        # initialize geometric network
+        self.initialize_geo_layers()
+
+        # deviation_network to compute alpha from sdf from NeuS
+        self.deviation_network = LearnedVariance(init_val=self.config.beta_init)
+
+        # color network
+        dims = [self.config.hidden_dim_color for _ in range(self.config.num_layers_color)]
+        # point, view_direction, normal, feature, embedding
+        in_dim = (
+            3
+            + self.direction_encoding.get_out_dim()
+            + 3
+            + self.config.geo_feat_dim
+        )
+        dims = [in_dim] + dims + [3]
+        self.num_layers_color = len(dims)
+
+        for layer in range(0, self.num_layers_color - 1):
+            out_dim = dims[layer + 1]
+            lin = nn.Linear(dims[layer], out_dim)
+
+            if self.config.weight_norm:
+                lin = nn.utils.weight_norm(lin)
+            setattr(self, "clin" + str(layer), lin)
+
+        self.softplus = nn.Softplus(beta=100)
+        self.relu = nn.ReLU()
+        self.sigmoid = torch.nn.Sigmoid()
+
+        self._cos_anneal_ratio = 1.0
+
+
+
+    def initialize_geo_layers(self) -> None:
+        """
+        Initialize layers for geometric network (sdf)
+        """
+        # MLP with geometric initialization
+        dims = [self.config.hidden_dim for _ in range(self.config.num_layers)]
+        in_dim = 3 + self.position_encoding.get_out_dim() + self.encoding_dim
+        dims = [in_dim] + dims + [1 + self.config.geo_feat_dim]
+        self.num_layers = len(dims)
+        self.skip_in = [4]
+
+        for layer in range(0, self.num_layers - 1):
+            if layer + 1 in self.skip_in:
+                out_dim = dims[layer + 1] - dims[0]
+            else:
+                out_dim = dims[layer + 1]
+
+            lin = nn.Linear(dims[layer], out_dim)
+
+            if self.config.geometric_init:
+                if layer == self.num_layers - 2:
+                    if not self.config.inside_outside:
+                        torch.nn.init.normal_(lin.weight, mean=np.sqrt(np.pi) / np.sqrt(dims[layer]), std=0.0001)
+                        torch.nn.init.constant_(lin.bias, -self.config.bias)
+                    else:
+                        torch.nn.init.normal_(lin.weight, mean=-np.sqrt(np.pi) / np.sqrt(dims[layer]), std=0.0001)
+                        torch.nn.init.constant_(lin.bias, self.config.bias)
+                elif layer == 0:
+                    torch.nn.init.constant_(lin.bias, 0.0)
+                    torch.nn.init.constant_(lin.weight[:, 3:], 0.0)
+                    torch.nn.init.normal_(lin.weight[:, :3], 0.0, np.sqrt(2) / np.sqrt(out_dim))
+                elif layer in self.skip_in:
+                    torch.nn.init.constant_(lin.bias, 0.0)
+                    torch.nn.init.normal_(lin.weight, 0.0, np.sqrt(2) / np.sqrt(out_dim))
+                    torch.nn.init.constant_(lin.weight[:, -(dims[0] - 3) :], 0.0)
+                else:
+                    torch.nn.init.constant_(lin.bias, 0.0)
+                    torch.nn.init.normal_(lin.weight, 0.0, np.sqrt(2) / np.sqrt(out_dim))
+
+            if self.config.weight_norm:
+                lin = nn.utils.weight_norm(lin)
+            setattr(self, "glin" + str(layer), lin)
+
+    def set_cos_anneal_ratio(self, anneal: float) -> None:
+        """Set the anneal value for the proposal network."""
+        self._cos_anneal_ratio = anneal
+
+    def forward_geonetwork(
+            self, 
+            inputs: Float[Tensor, "*batch 3"], 
+            encoding: None
+        ) -> Float[Tensor, "*batch geo_features+1"]:
+        """forward the geonetwork"""
+        
+        
+        # !!! The inputs should already be normalized to [0, 1]
+        # !!! And then fed into the encoding network
+        # the self.get_encoded_input must be called first
+        inputs, encoded_inputs = self.get_encoded_input(inputs, encoding)
+
+        # should the input of the positional encoding before or after normalization?
+        pe = self.position_encoding(inputs)
+
+        inputs = torch.cat((inputs, pe, encoded_inputs), dim=-1)
+
+        # Pass through layers
+        outputs = inputs
+
+        for layer in range(0, self.num_layers - 1):
+            lin = getattr(self, "glin" + str(layer))
+
+            if layer in self.skip_in:
+                outputs = torch.cat([outputs, inputs], 1) / np.sqrt(2)
+
+            outputs = lin(outputs)
+
+            if layer < self.num_layers - 2:
+                outputs = self.softplus(outputs)
+        return outputs
+    
+    def get_encoded_input(self, x: Float[Tensor, "*batch 3"], encoding = None) -> Float[Tensor, "*batch D"]:
+        # map range [-1, 1] to [0, 1]
+        x = (x + 1.0) / 2.0
+        encoded = encoding(x)
+        return x, encoded
+
+    def get_sdf(self, ray_samples: RaySamples, encoding = None) -> Float[Tensor, "num_samples ... 1"]:
+        """predict the sdf value for ray samples"""
+        positions = ray_samples.frustums.get_start_positions()
+        positions_flat = positions.view(-1, 3)
+        hidden_output = self.forward_geonetwork(positions_flat, encoding).view(*ray_samples.frustums.shape, -1)
+        sdf, _ = torch.split(hidden_output, [1, self.config.geo_feat_dim], dim=-1)
+        return sdf
+    
+    def get_alpha(
+        self,
+        ray_samples: RaySamples,
+        encoding: None,
+        sdf: Optional[Float[Tensor, "num_samples ... 1"]] = None,
+        gradients: Optional[Float[Tensor, "num_samples ... 1"]] = None,
+    ) -> Float[Tensor, "num_samples ... 1"]:
+        """compute alpha from sdf as in NeuS"""
+        if sdf is None or gradients is None:
+            inputs = ray_samples.frustums.get_start_positions()
+            inputs.requires_grad_(True)
+            with torch.enable_grad():
+                hidden_output = self.forward_geonetwork(inputs, encoding)
+                sdf, _ = torch.split(hidden_output, [1, self.config.geo_feat_dim], dim=-1)
+            d_output = torch.ones_like(sdf, requires_grad=False, device=sdf.device)
+            gradients = torch.autograd.grad(
+                outputs=sdf,
+                inputs=inputs,
+                grad_outputs=d_output,
+                create_graph=True,
+                retain_graph=True,
+                only_inputs=True,
+            )[0]
+
+        inv_s = self.deviation_network.get_variance()  # Single parameter
+
+        true_cos = (ray_samples.frustums.directions * gradients).sum(-1, keepdim=True)
+
+        # anneal as NeuS
+        cos_anneal_ratio = self._cos_anneal_ratio
+
+        # "cos_anneal_ratio" grows from 0 to 1 in the beginning training iterations. The anneal strategy below makes
+        # the cos value "not dead" at the beginning training iterations, for better convergence.
+        iter_cos = -(
+            F.relu(-true_cos * 0.5 + 0.5) * (1.0 - cos_anneal_ratio) + F.relu(-true_cos) * cos_anneal_ratio
+        )  # always non-positive
+
+        # Estimate signed distances at section points
+        estimated_next_sdf = sdf + iter_cos * ray_samples.deltas * 0.5
+        estimated_prev_sdf = sdf - iter_cos * ray_samples.deltas * 0.5
+
+        prev_cdf = torch.sigmoid(estimated_prev_sdf * inv_s)
+        next_cdf = torch.sigmoid(estimated_next_sdf * inv_s)
+
+        p = prev_cdf - next_cdf
+        c = prev_cdf
+
+        alpha = ((p + 1e-5) / (c + 1e-5)).clip(0.0, 1.0)
+
+        return alpha
+
+    def get_density(self, ray_samples: RaySamples):
+        #@ Use the s_density function?
+        raise NotImplementedError
+    
+    def get_colors(
+        self,
+        points: Float[Tensor, "*batch 3"],
+        directions: Float[Tensor, "*batch 3"],
+        normals: Float[Tensor, "*batch 3"],
+        geo_features: Float[Tensor, "*batch geo_feat_dim"]
+    ) -> Float[Tensor, "*batch 3"]:
+        """compute colors"""
+        d = self.direction_encoding(directions)
+
+        hidden_input = torch.cat(
+            [
+                points,
+                d,
+                normals,
+                geo_features.view(-1, self.config.geo_feat_dim),
+            ],
+            dim=-1,
+        )
+
+        for layer in range(0, self.num_layers_color - 1):
+            lin = getattr(self, "clin" + str(layer))
+
+            hidden_input = lin(hidden_input)
+
+            if layer < self.num_layers_color - 2:
+                hidden_input = self.relu(hidden_input)
+
+        rgb = self.sigmoid(hidden_input)
+
+        return rgb
+        
+    def get_outputs(
+        self,
+        ray_samples: RaySamples,
+        encoding = None,
+        return_alphas: bool = False,
+    ) -> Dict[FieldHeadNames, Tensor]:
+        """compute output of ray samples"""
+        outputs = {}
+
+        camera_indices = ray_samples.camera_indices.squeeze()
+
+        inputs = ray_samples.frustums.get_start_positions()
+        inputs = inputs.view(-1, 3)
+
+        directions = ray_samples.frustums.directions
+        directions_flat = directions.reshape(-1, 3)
+
+        inputs.requires_grad_(True)
+        with torch.enable_grad():
+            hidden_output = self.forward_geonetwork(inputs, encoding)
+            sdf, geo_feature = torch.split(hidden_output, [1, self.config.geo_feat_dim], dim=-1)
+        d_output = torch.ones_like(sdf, requires_grad=False, device=sdf.device)
+        gradients = torch.autograd.grad(
+            outputs=sdf, inputs=inputs, grad_outputs=d_output, create_graph=True, retain_graph=True, only_inputs=True
+        )[0]
+
+        rgb = self.get_colors(inputs, directions_flat, gradients, geo_feature, camera_indices)
+
+        rgb = rgb.view(*ray_samples.frustums.directions.shape[:-1], -1)
+        sdf = sdf.view(*ray_samples.frustums.directions.shape[:-1], -1)
+        gradients = gradients.view(*ray_samples.frustums.directions.shape[:-1], -1)
+        normals = torch.nn.functional.normalize(gradients, p=2, dim=-1)
+
+        outputs.update(
+            {
+                FieldHeadNames.RGB: rgb,
+                FieldHeadNames.SDF: sdf,
+                FieldHeadNames.NORMALS: normals,
+                FieldHeadNames.GRADIENT: gradients,
+            }
+        )
+
+        if return_alphas:
+            alphas = self.get_alpha(ray_samples, sdf, gradients)
+            outputs.update({FieldHeadNames.ALPHA: alphas})
+
+        return outputs
+    
+    def forward(
+        self, 
+        ray_samples: RaySamples, 
+        encoding = None,
+        return_alphas: bool = False
+    ) -> Dict[FieldHeadNames, Tensor]:
+        """Evaluates the field at points along the ray.
+
+        Args:
+            ray_samples: Samples to evaluate field on.
+            return_alphas: Whether to return alpha values
+        """
+        field_outputs = self.get_outputs(ray_samples, encoding, return_alphas=return_alphas)
+        return field_outputs
+
+
+
 
 @dataclass
 class ScaffoldGaussianModelConfig(ModelConfig):
@@ -114,6 +443,25 @@ class ScaffoldGaussianModelConfig(ModelConfig):
     """Whether to use hash encoding"""
     smoothstep: bool = True
     """Whether to use the smoothstep function"""
+
+    neus_config: ScaffoldGSNeusFieldConfig = ScaffoldGSNeusFieldConfig()
+    eikonal_loss_mult = 0.1
+
+    # neus sampler
+    num_samples: int = 64
+    """Number of uniform samples"""
+    num_samples_importance: int = 64
+    """Number of importance samples"""
+    num_up_sample_steps: int = 4
+    """number of up sample step, 1 for simple coarse-to-fine sampling"""
+    base_variance: float = 64
+    """fixed base variance in NeuS sampler, the inv_s will be base * 2 ** iter during upsample"""
+    perturb: bool = True
+    """use to use perturb for the sampled points"""
+    num_samples_outside = 32
+
+    
+
     
 class ScaffoldGaussianModel(Model):
 
@@ -266,6 +614,31 @@ class ScaffoldGaussianModel(Model):
         self.temp_opacity = torch.empty(0)
 
         self.aabb = self.scene_box.aabb.cuda()
+
+        # Neus field
+        self.neus = ScaffoldGSNeusField(self.config.neus_config)
+        self.neus_sampler = NeuSSampler(
+            num_samples=self.config.num_samples,
+            num_samples_importance=self.config.num_samples_importance,
+            num_samples_outside=self.config.num_samples_outside,
+            num_upsample_steps=self.config.num_up_sample_steps,
+            base_variance=self.config.base_variance,
+        )
+
+        self.field_background = nn.Parameter(torch.ones(1), requires_grad=False)
+
+        self.renderer_rgb = RGBRenderer(background_color="white" if self.config.white_background else "black")
+        self.renderer_accumulation = AccumulationRenderer()
+        self.renderer_depth = DepthRenderer(method="expected")
+        self.renderer_normal = SemanticRenderer()
+
+        self.rgb_loss = L1Loss()
+        self.eikonal_loss = MSELoss()
+
+        self.anneal_end = 50000
+
+
+
 
     def step_cb(self, step):
         self.step = step
@@ -441,7 +814,10 @@ class ScaffoldGaussianModel(Model):
             "encoding_embedding" : self.encoding.parameters(),
             "mlp_opacity" : self.mlp_opacity.parameters(),
             "mlp_cov" : self.mlp_cov.parameters(),
-            "mlp_color" : self.mlp_color.parameters()
+            "mlp_color" : self.mlp_color.parameters(),
+
+            "neus" : self.neus.parameters(),
+            "neus_background" : [self.field_background]
         }
         if self.use_feat_bank:
             params.update({"mlp_featurebank" : self.mlp_feature_bank.parameters()})
@@ -550,7 +926,8 @@ class ScaffoldGaussianModel(Model):
             if  'mlp' in group or \
                 'conv' in group or \
                 'feat_base' in group or \
-                'embedding' in group:
+                'embedding' in group or \
+                'neus' in group:
                 continue
             assert len(param) == 1
             extension_tensor = tensors_dict[group]
@@ -611,7 +988,8 @@ class ScaffoldGaussianModel(Model):
             if  'mlp' in group or \
                 'conv' in group or \
                 'feat_base' in group or \
-                'embedding' in group:
+                'embedding' in group or\
+                'neus' in group:
                 continue
             optimizer = optimizers.optimizers[group]
 
@@ -898,6 +1276,20 @@ class ScaffoldGaussianModel(Model):
     ) -> List[TrainingCallback]:
         cbs = []
         cbs.append(TrainingCallback([TrainingCallbackLocation.BEFORE_TRAIN_ITERATION], self.step_cb))
+        
+        if self.anneal_end > 0:
+            def set_anneal(step):
+                anneal = min([1.0, step / self.anneal_end])
+                self.neus.set_cos_anneal_ratio(anneal)
+
+            cbs.append(
+                TrainingCallback(
+                    where_to_run=[TrainingCallbackLocation.BEFORE_TRAIN_ITERATION],
+                    update_every_num_iters=1,
+                    func=set_anneal,
+                )
+            )
+        
         # The order of these matters
         cbs.append(
             TrainingCallback(
@@ -989,8 +1381,24 @@ class ScaffoldGaussianModel(Model):
     def encod_input(self, x):
         x = SceneBox.get_normalized_positions(x, self.aabb)
         return self.encoding(x)
+    
+    def sample_and_forward_field(self, ray_bundle: RayBundle) -> Dict:
+        ray_samples : RaySamples = self.neus_sampler(ray_bundle, sdf_fn=self.neus.get_sdf)
+        field_outputs = self.neus(ray_samples, self.encoding, return_alphas=True)
+        weights, transmittance = ray_samples.get_weights_and_transmittance_from_alphas(
+            field_outputs[FieldHeadNames.ALPHA]
+        )
+        bg_transmittance = transmittance[:, -1, :]
 
-    def get_outputs(self, camera: Cameras) -> Dict[str, Union[torch.Tensor, List]]:
+        samples_and_field_outputs = {
+            "ray_samples": ray_samples,
+            "field_outputs": field_outputs,
+            "weights": weights,
+            "bg_transmittance": bg_transmittance,
+        }
+        return samples_and_field_outputs
+
+    def get_outputs_gs(self, camera: Cameras)-> Dict[str, Union[torch.Tensor, List]]:
         if not isinstance(camera, Cameras):
             print("Called get_outputs with not a camera")
             return {}
@@ -1001,11 +1409,79 @@ class ScaffoldGaussianModel(Model):
         render_pkg = self.renderer.render(viewpoint_cam, self, self.background, self.voxel_visible_mask, True)
         image, self.viewspace_point_tensor, self.visibility_filter, self.offset_selection_mask, radii, scaling, self.temp_opacity = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["selection_mask"], render_pkg["radii"], render_pkg["scaling"], render_pkg["neural_opacity"]
 
-        return {
-            'rgb' : image.permute(1, 2, 0).clamp(0, 1) # (H, W, 3)
-            }
+        return {'rgb_gs' : image.permute(1, 2, 0).clamp(0, 1)} # (H, W, 3)}
     
-    def get_metrics_dict(self, outputs, batch) -> Dict[str, torch.Tensor]:
+    def get_outputs_neus(self, ray_bundle: RayBundle)-> Dict[str, Union[torch.Tensor, List]]:
+        assert (
+            ray_bundle.metadata is not None and "directions_norm" in ray_bundle.metadata
+        ), "directions_norm is required in ray_bundle.metadata"
+
+        
+        samples_and_field_outputs = self.sample_and_forward_field(ray_bundle=ray_bundle)
+
+        # shortcuts
+        field_outputs: Dict[FieldHeadNames, torch.Tensor] = cast(
+            Dict[FieldHeadNames, torch.Tensor], samples_and_field_outputs["field_outputs"]
+        )
+        ray_samples = samples_and_field_outputs["ray_samples"]
+        weights = samples_and_field_outputs["weights"]
+        bg_transmittance = samples_and_field_outputs["bg_transmittance"]
+
+        rgb = self.renderer_rgb(rgb=field_outputs[FieldHeadNames.RGB], weights=weights)
+        depth = self.renderer_depth(weights=weights, ray_samples=ray_samples)
+        # the rendered depth is point-to-point distance and we should convert to depth
+        depth = depth / ray_bundle.metadata["directions_norm"]
+
+        normal = self.renderer_normal(semantics=field_outputs[FieldHeadNames.NORMALS], weights=weights)
+        accumulation = self.renderer_accumulation(weights=weights)
+
+        outputs = {
+            "rgb_neus": rgb,
+            "accumulation": accumulation,
+            "depth": depth,
+            "normal": normal,
+            "weights": weights,
+            # used to scale z_vals for free space and sdf loss
+            "directions_norm": ray_bundle.metadata["directions_norm"],
+        }
+
+        if self.training:
+            grad_points = field_outputs[FieldHeadNames.GRADIENT]
+            outputs.update({"eik_grad": grad_points})
+            outputs.update(samples_and_field_outputs)
+
+        return outputs
+
+    
+    def get_outputs(self, camera: Cameras, ray_bundle: RayBundle) -> Dict[str, Union[torch.Tensor, List]]:
+
+        outputs_gs = self.get_outputs_gs(camera)
+        outputs_neus = self.get_outputs_neus(ray_bundle)
+
+        return {**outputs_gs, **outputs_neus}
+
+    def forward(self, camera: Cameras, ray_bundle: RayBundle) -> Dict[str, Union[torch.Tensor, List]]:
+        return self.get_outputs(camera, ray_bundle)
+    
+    def get_metrics_dict_gs(self, outputs, batch)-> Dict[str, torch.Tensor]:
+        metrics_dict = {}
+        gt_rgb = batch["image"].to(self.device)  # RGB or RGBA image
+        predicted_rgb = outputs["rgb_gs"]
+
+        metrics_dict["psnr_gs"] = self.psnr(predicted_rgb, gt_rgb)
+        metrics_dict["anchor_count"] = self._anchor.shape[0]
+
+        return metrics_dict
+    
+    def get_metrics_dict_neus(self, outputs, batch)-> Dict[str, torch.Tensor]:
+        metrics_dict = {}
+        gt_rgb = batch["image"].to(self.device)
+        gt_rgb = self.renderer_rgb.blend_background(gt_rgb)
+        metrics_dict["psnr_neus"] = self.psnr(outputs["rgb_neus"], gt_rgb)
+        return metrics_dict
+    
+    
+    def get_metrics_dict(self, outputs, batch_gs, batch_neus) -> Dict[str, torch.Tensor]:
         """Compute and returns metrics.
 
         Args:
@@ -1013,17 +1489,39 @@ class ScaffoldGaussianModel(Model):
             batch: ground truth batch corresponding to outputs
         """
         
-        gt_img = batch["image"]
         metrics_dict = {}
-        gt_rgb = gt_img.to(self.device)  # RGB or RGBA image
-        predicted_rgb = outputs["rgb"]
-
-        metrics_dict["psnr"] = self.psnr(predicted_rgb, gt_rgb)
-
-        metrics_dict["anchor_count"] = self._anchor.shape[0]
+        metrics_dict.update(**self.get_metrics_dict_gs(outputs, batch_gs))
+        metrics_dict.update(**self.get_metrics_dict_neus(outputs, batch_neus))
+        
         return metrics_dict
+    
+    def get_loss_dict_gs(self, outputs, batch) -> Dict[str, torch.Tensor]:
+        gt_img = batch["image"].to(self.device)
+        Ll1 = torch.abs(gt_img - outputs["rgb_gs"]).mean()
+        simloss = 1 - self.ssim(gt_img.permute(2, 0, 1)[None, ...], outputs["rgb"].permute(2, 0, 1)[None, ...])
+        
+        return {
+            "loss_gs": (1 - self.config.ssim_lambda) * Ll1 + self.config.ssim_lambda * simloss,
+        }
+    
+    def get_loss_dict_neus(self, outputs, batch) -> Dict[str, torch.Tensor]:
+        loss_dict = {}
+        image = batch["image"].to(self.device)
+        pred_image, image = self.renderer_rgb.blend_background_for_loss_computation(
+            pred_image=outputs["rgb_neus"],
+            pred_accumulation=outputs["accumulation"],
+            gt_image=image,
+        )
+        loss_dict["rgb_loss_neus"] = self.rgb_loss(image, pred_image)
+        if self.training:
+            # eikonal loss
+            grad_theta = outputs["eik_grad"]
+            loss_dict["eikonal_loss"] = ((grad_theta.norm(2, dim=-1) - 1) ** 2).mean() * self.config.eikonal_loss_mult
 
-    def get_loss_dict(self, outputs, batch, metrics_dict=None) -> Dict[str, torch.Tensor]:
+        return loss_dict
+
+
+    def get_loss_dict(self, outputs, batch_gs, batch_neus, metrics_dict=None) -> Dict[str, torch.Tensor]:
         """Computes and returns the losses dict.
 
         Args:
@@ -1032,14 +1530,11 @@ class ScaffoldGaussianModel(Model):
             metrics_dict: dictionary of metrics, some of which we can use for loss
         """
         
-        gt_img = batch["image"]
-        Ll1 = torch.abs(gt_img - outputs["rgb"]).mean()
-        simloss = 1 - self.ssim(gt_img.permute(2, 0, 1)[None, ...], outputs["rgb"].permute(2, 0, 1)[None, ...])
-        
+        loss_dict = {}
+        loss_dict.update(self.get_loss_dict_gs(outputs, batch_gs))
+        loss_dict.update(self.get_loss_dict_neus(outputs, batch_neus))
 
-        return {
-            "main_loss": (1 - self.config.ssim_lambda) * Ll1 + self.config.ssim_lambda * simloss,
-        }
+        return loss_dict
 
     @torch.no_grad()
     def get_outputs_for_camera(self, camera: Cameras, obb_box= None) -> Dict[str, torch.Tensor]:
@@ -1050,45 +1545,52 @@ class ScaffoldGaussianModel(Model):
             camera: generates raybundle
         """
         assert camera is not None, "must provide camera to gaussian model"
-        outs = self.get_outputs(camera.to(self.device))
+        ray_bundle =  self.get_outputs_for_camera_ray_bundle(
+            camera.generate_rays(camera_indices=0, keep_shape=True, obb_box=obb_box)
+        )
+        
+        outs = self.get_outputs(camera.to(self.device), ray_bundle)
         return outs  # type: ignore
     
     def get_image_metrics_and_images(
         self, outputs: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor]
     ) -> Tuple[Dict[str, float], Dict[str, torch.Tensor]]:
-        """Writes the test image outputs.
 
-        Args:
-            image_idx: Index of the image.
-            step: Current step.
-            batch: Batch of data.
-            outputs: Outputs of the model.
-
-        Returns:
-            A dictionary of metrics.
-        """
         
         gt_img = batch["image"]
-        predicted_rgb = outputs["rgb"]
-
         gt_rgb = gt_img.to(self.device)
 
-        combined_rgb = torch.cat([gt_rgb, predicted_rgb], dim=1)
+        predicted_rgb_gs = outputs["rgb_gs"]
+        predicted_rgb_neus = outputs["rgb_neus"]
+
+        combined_rgb_gs = torch.cat([gt_rgb, predicted_rgb_gs], dim=1)
+        combined_rgb_neus = torch.cat([gt_rgb, predicted_rgb_neus], dim=1)
 
         # Switch images from [H, W, C] to [1, C, H, W] for metrics computations
 
         gt_rgb = torch.moveaxis(gt_rgb, -1, 0)[None, ...]
-        predicted_rgb = torch.moveaxis(predicted_rgb, -1, 0)[None, ...]
+        combined_rgb_gs = torch.moveaxis(combined_rgb_gs, -1, 0)[None, ...]
+        combined_rgb_neus = torch.moveaxis(combined_rgb_neus, -1, 0)[None, ...]
 
-        psnr = self.psnr(gt_rgb, predicted_rgb)
-        ssim = self.ssim(gt_rgb, predicted_rgb)
-        lpips = self.lpips(gt_rgb, predicted_rgb)
+        psnr_gs = self.psnr(gt_rgb, combined_rgb_gs)
+        ssim_gs = self.ssim(gt_rgb, combined_rgb_gs)
+        lpips_gs = self.lpips(gt_rgb, combined_rgb_gs)
+
+        psnr_neus = self.psnr(gt_rgb, combined_rgb_neus)
+        ssim_neus = self.ssim(gt_rgb, combined_rgb_neus)
+        lpips_neus = self.lpips(gt_rgb, combined_rgb_neus)
 
         # all of these metrics will be logged as scalars
-        metrics_dict = {"psnr": float(psnr.item()), "ssim": float(ssim)}  # type: ignore
-        metrics_dict["lpips"] = float(lpips)
+        metrics_dict = {
+            "psnr_gs": float(psnr_gs.item()), 
+            "ssim_gs": float(ssim_gs.item()),
+            "lpips_gs": float(lpips_gs.item()),
+            "psnr_neus": float(psnr_neus.item()), 
+            "ssim_neus": float(ssim_neus.item()),
+            "lpips_neus": float(lpips_neus.item()),}  # type: ignore
 
-        images_dict = {"img": combined_rgb}
+
+        images_dict = {"img_gs": combined_rgb_gs, "img_neus": combined_rgb_neus}
 
         return metrics_dict, images_dict
 

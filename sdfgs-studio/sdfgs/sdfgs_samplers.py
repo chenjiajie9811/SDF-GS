@@ -82,7 +82,7 @@ class NeuSAccSampler(Sampler):
         # also use the pdf_sampler and outside_sampler in neus
         self.neus_sampler = neus_sampler
 
-        self.grid = OccGridEstimator(aabb.reshape(-1), resolution=self.resolution, levels=4).train()
+        self.grid = OccGridEstimator(aabb.reshape(-1), resolution=self.resolution, levels=1).train()
         # self.register_buffer("_binary", torch.ones((self.grid_size, self.grid_size, self.grid_size), dtype=torch.bool))
         self.register_buffer("_update_counter", torch.zeros(1, dtype=torch.int32))
 
@@ -92,15 +92,26 @@ class NeuSAccSampler(Sampler):
         assert inv_s is not None
         inv_s = inv_s().item()
         self.step_size = 14.0 / inv_s / 16
-        print (f"step{step}: {self.step_size}")
+        # print (f"step{step}: {self.step_size}")
 
     @torch.no_grad()
     def update_binary_grid_w_sdf(self, step, sdf_fn=None, inv_s=None):
         assert sdf_fn is not None
         assert inv_s is not None
         if step >= self.steps_warpup and step % self.steps_per_grid_update == 0:
-            mask = self.grid.binaries.reshape(-1)
-            occupied_voxel = self.grid.grid_coords[mask]
+            if step == self.steps_warpup:
+                mask = torch.ones_like(self.grid.binaries.reshape(-1))
+                occupied_voxel = self.grid.grid_coords
+            else:
+                mask = self.grid.binaries.reshape(-1)
+                occupied_voxel = self.grid.grid_coords[mask]
+                save_points(f"occupied_voxel_{step}.ply", occupied_voxel.cpu().numpy())
+
+
+            occupied_voxel = occupied_voxel / (self.grid.resolution - 1)
+            occupied_voxel = (occupied_voxel - torch.ones_like(occupied_voxel) * 0.5) * (self.aabb[1, 0] - self.aabb[0, 0])
+
+            # 
 
             def evaluate(points):
                 z = []
@@ -116,9 +127,12 @@ class NeuSAccSampler(Sampler):
             sdf = sdf.abs()
 
             sdf_mask = sdf <= 0.05
+
             mask[mask.clone()] = sdf_mask
 
-            self.grid.binaries = mask.reshape([self.grid_size] * 3).contiguous()
+            self.grid.binaries = mask.reshape(self.grid.binaries.shape).contiguous()
+
+            save_points("voxel_valid.ply", self.grid.grid_coords[self.grid.binaries.reshape(-1)].cpu().numpy())
 
             self._update_counter += 1
             print ("update_binary_grid_w_sdf")
@@ -133,12 +147,12 @@ class NeuSAccSampler(Sampler):
         
         points = points[mask]
         # shift and rescale to [0, 1]
-        points = points / (self.aabb[0, 1] - self.aabb[0, 0]) + torch.ones_like(points) * 0.5
+        points = points / (self.aabb[1, 0] - self.aabb[0, 0]) + torch.ones_like(points) * 0.5
+
         # voxelize the points
-        occ_vox_idx = torch.unique(torch.round(points * self.grid_size), dim=0).long()
-        self.grid.binaries[occ_vox_idx[:, 0], occ_vox_idx[:, 1], occ_vox_idx[:, 2]] = 1
-        #@TODO check bug here!
-        
+        occ_vox_idx = torch.unique(torch.round(points * (self.grid_size - 1)), dim=0).long()
+
+        self.grid.binaries[0][occ_vox_idx[:, 0], occ_vox_idx[:, 1], occ_vox_idx[:, 2]] = 1
         save_points("init_vox.ply", points)
         print ("update_binary_grid_w_points")
 
@@ -176,23 +190,13 @@ class NeuSAccSampler(Sampler):
         assert sdf_fn is not None
 
         # sampler with original neus Sampler?
-        # if self._update_counter.item() <= 0:
-        #     return self.neus_sampler(ray_bundle, sdf_fn=sdf_fn)
+        if self._update_counter.item() <= 0:
+            return self.neus_sampler(ray_bundle, sdf_fn=sdf_fn)
 
         assert alpha_fn is not None
 
-        #@TODO check https://github.com/nerfstudio-project/nerfacc/blob/master/examples/utils.py#L54
-        # to modify the sampling method 
-        def occ_eval_fn(x):
-            hidden_output = neus_fields.forward_geonetwork(x)
-            sdf, _ = torch.split(hidden_output, [1, neus_fields.config.geo_feat_dim], dim=-1)
-            return -sdf * 1e-3
+        # check https://github.com/nerfstudio-project/nerfacc/blob/master/examples/utils.py#L54
         
-        self.grid._update(
-            step=self._update_counter.item(),
-            occ_eval_fn=occ_eval_fn,
-            occ_thre= 0.01
-        )
 
         def alpha_fn_(t_starts, t_ends, ray_indices):
             t_origins = ray_bundle.origins[ray_indices]
@@ -201,7 +205,8 @@ class NeuSAccSampler(Sampler):
 
             hidden_output = neus_fields.forward_geonetwork(inputs)
             sdf, _ = torch.split(hidden_output, [1, neus_fields.config.geo_feat_dim], dim=-1)
-            return (s_density_func(neus_fields.deviation_network.get_variance(), sdf)).squeeze(-1)
+            return -sdf.abs().squeeze(-1)
+            # return (s_density_func(neus_fields.deviation_network.get_variance(), sdf)).squeeze(-1)
 
         # sampling from occupancy grids
         ray_indices, t_starts, t_ends = self.grid.sampling(
@@ -210,20 +215,17 @@ class NeuSAccSampler(Sampler):
             alpha_fn=alpha_fn_,
             # near_plane=ray_bundle.nears[:, 0].contiguous(),
             # far_plane=ray_bundle.fars[:, 0].contiguous(),
-            alpha_thre=0.01
+            alpha_thre=-0.05
         )
-
-        # print (torch.unique(ray_indices))
-        # print (ray_indices.shape)
-        # input()
 
         # create ray_samples with the intersection
         ray_indices = ray_indices.long()
         ray_samples = self.create_ray_samples_from_ray_indices(ray_bundle, ray_indices, t_starts[...,None], t_ends[...,None])
 
 
-        save_points("first.ply", ray_samples.frustums.get_start_positions().cpu().numpy().reshape(-1, 3))
-        print("saved")
+        # save_points("first.ply", ray_samples.frustums.get_start_positions().cpu().numpy().reshape(-1, 3))
+        # print("saved")
+        # input()
 
         # total_iters = 0
         # sorted_index = None

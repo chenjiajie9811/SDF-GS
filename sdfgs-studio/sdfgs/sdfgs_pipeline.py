@@ -272,4 +272,17 @@ class NeuSAccPipeline(VanillaPipeline):
             pts = self.datamanager.train_dataparser_outputs.metadata["points3D_xyz"]
             # pts_rgb = self.datamanager.train_dataparser_outputs.metadata["points3D_rgb"]
 
-        self.model.sampler.update_binary_grid_w_points(pts)
+
+        # to modify the sampling method 
+        # def occ_eval_fn(x):
+        #     hidden_output = self.model.field.forward_geonetwork(x)
+        #     sdf, _ = torch.split(hidden_output, [1, self.model.field.config.geo_feat_dim], dim=-1)
+        #     return sdf.abs()
+        
+        # self.model.sampler.grid._update(
+        #     step=0,
+        #     occ_eval_fn=occ_eval_fn,
+        #     occ_thre= 0.05
+        # )
+        # self.model.sampler.update_binary_grid_w_points(pts)
+        

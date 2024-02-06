@@ -12,10 +12,8 @@ import torch.distributed as dist
 from torch.cuda.amp.grad_scaler import GradScaler
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from sdfgs.scaffoldgs_model import ScaffoldGaussianModel, ScaffoldGaussianModelConfig
-
-from nerfstudio.data.datamanagers.full_images_datamanager import FullImageDatamanagerConfig
-
+from sdfgs.sdfgs_datamanager import SDFGSDataManagerConfig
+from sdfgs.scaffoldgs_neus_model import ScaffoldGaussianModel, ScaffoldGaussianModelConfig
 from nerfstudio.data.datamanagers.base_datamanager import (
     DataManager,
     DataManagerConfig,
@@ -28,29 +26,44 @@ from nerfstudio.pipelines.base_pipeline import (
     VanillaPipelineConfig,
     module_wrapper
 )
+from nerfstudio.data.dataparsers.colmap_dataparser import ColmapDataParserConfig
 
 from nerfstudio.utils import profiler
+
+from pathlib import Path
+
 from utils.graphics_utils import BasicPointCloud
 
+
 @dataclass
-class ScafflodGSPipelineConfig(VanillaPipelineConfig):
+class SDFGSPipelineConfig(VanillaPipelineConfig):
     """Configuration for pipeline instantiation"""
 
-    _target: Type = field(default_factory=lambda: ScafflodGSPipeline)
+    _target: Type = field(default_factory=lambda: SDFGSPipeline)
     """target class to instantiate"""
-    datamanager: DataManagerConfig = FullImageDatamanagerConfig()
+    datamanager: DataManagerConfig = SDFGSDataManagerConfig(
+        dataparser=ColmapDataParserConfig(
+                        data=Path('/usr/stud/chj/storage/user/chj/datasets/db/playroom'),
+                        colmap_path=Path("sparse/0"),
+                        scale_factor=0.7, # try to make all the scene inside the -1, 1 box
+                        load_3D_points=True,
+                    ),
+    )
     """specifies the datamanager config"""
-    model: ModelConfig = ScaffoldGaussianModelConfig()
-    """specifies the model config"""
-    
+    model: ScaffoldGaussianModelConfig = ScaffoldGaussianModelConfig()
+    """specifies the gs model config"""
+    steps_sdf_init: int = 250
+    """steps to run volume rendering alone for initialization"""
+    interval_reset_mesh: int = 250
+    """interval to run marching cubes from the sdf field"""
 
 
-class ScafflodGSPipeline(Pipeline):
+class SDFGSPipeline(Pipeline):
 
 
     def __init__(
         self,
-        config: ScafflodGSPipelineConfig,
+        config: SDFGSPipelineConfig,
         device: str,
         test_mode: Literal["test", "val", "inference"] = "val",
         world_size: int = 1,
@@ -60,22 +73,23 @@ class ScafflodGSPipeline(Pipeline):
         super().__init__()
         self.config = config
         self.test_mode = test_mode
+        
+        # data manager
         self.datamanager: DataManager = config.datamanager.setup(
             device=device, test_mode=test_mode, world_size=world_size, local_rank=local_rank
         )
-        seed_pts = None
         if (
             hasattr(self.datamanager, "train_dataparser_outputs")
             and "points3D_xyz" in self.datamanager.train_dataparser_outputs.metadata
         ):
             pts = self.datamanager.train_dataparser_outputs.metadata["points3D_xyz"]
             pts_rgb = self.datamanager.train_dataparser_outputs.metadata["points3D_rgb"]
-            # seed_pts = (pts, pts_rgb)
+
         self.datamanager.to(device)
 
         assert self.datamanager.train_dataset is not None, "Missing input dataset"
 
-
+        # model
         self._model : ScaffoldGaussianModel = config.model.setup(
             scene_box=self.datamanager.train_dataset.scene_box,
             num_train_data=len(self.datamanager.train_dataset),
@@ -85,7 +99,7 @@ class ScafflodGSPipeline(Pipeline):
         )
         self._model.to(device)
 
-        
+        # set up model
         aabb = self.datamanager.train_dataset.scene_box.aabb
         mask = (pts[:, 0] >= aabb[0, 0]) & (pts[:, 0] < aabb[1, 0]) &\
                 (pts[:, 1] >= aabb[0, 1]) & (pts[:, 1] < aabb[1, 1]) &\
@@ -96,6 +110,7 @@ class ScafflodGSPipeline(Pipeline):
         pc = BasicPointCloud(points=pts, colors=pts_rgb / 255, normals=torch.zeros_like(pts))
         self._model.create_from_pcd(pc, 1.0)
         self._model.training_setup()
+
         
         self.world_size = world_size
         if world_size > 1:
@@ -110,7 +125,7 @@ class ScafflodGSPipeline(Pipeline):
     def model(self):
         """Returns the unwrapped model if in ddp"""
         return module_wrapper(self._model)
-
+    
     
     @profiler.time_function
     def get_train_loss_dict(self, step: int) -> Tuple[Any, Dict[str, Any], Dict[str, Any]]:
@@ -121,14 +136,13 @@ class ScafflodGSPipeline(Pipeline):
         Args:
             step: current iteration step to update sampler if using DDP (distributed)
         """
-        camera, batch = self.datamanager.next_train(step)
-        
-        model_outputs = self._model(camera)
-        metrics_dict = self.model.get_metrics_dict(model_outputs, batch)
-        loss_dict = self.model.get_loss_dict(model_outputs, batch, metrics_dict)
+        ray_bundle, ray_batch, camera, cam_batch = self.datamanager.next_train(step)
+
+        model_outputs = self._model.forward(camera, ray_bundle)  
+        metrics_dict = self._model.get_metrics_dict(model_outputs, cam_batch, ray_batch)
+        loss_dict = self._model.get_loss_dict(model_outputs, cam_batch, ray_batch)
 
         return model_outputs, loss_dict, metrics_dict
-
     
     def forward(self):
         """Blank forward method
@@ -146,11 +160,14 @@ class ScafflodGSPipeline(Pipeline):
             step: current iteration step
         """
         self.eval()
-        camera, batch = self.datamanager.next_eval(step)
-        model_outputs = self.model(camera)
-        metrics_dict = self.model.get_metrics_dict(model_outputs, batch)
-        loss_dict = self.model.get_loss_dict(model_outputs, batch, metrics_dict)
+
+        ray_bundle, ray_batch, camera, cam_batch = self.datamanager.next_eval(step)
+        model_outputs = self._model.forward(camera, ray_bundle)  
+        metrics_dict = self._model.get_metrics_dict(model_outputs, cam_batch, ray_batch)
+        loss_dict = self._model.get_loss_dict(model_outputs, cam_batch, ray_batch)
+
         self.train()
+
         return model_outputs, loss_dict, metrics_dict
 
     @profiler.time_function
@@ -163,16 +180,16 @@ class ScafflodGSPipeline(Pipeline):
         """
         self.eval()
         camera, batch = self.datamanager.next_eval_image(step)
-        outputs = self.model.get_outputs_for_camera(camera)
-        metrics_dict, images_dict = self.model.get_image_metrics_and_images(outputs, batch)
-        # self._model.save_ply(f'ouputs/gs_{step}.ply')
-        assert "num_rays" not in metrics_dict
-        metrics_dict["num_rays"] = (camera.height * camera.width * camera.size).item()
+        model_outputs = self.model.get_outputs_for_camera(camera)  
+        metrics_dict, images_dict = self.model.get_image_metrics_and_images(model_outputs, batch)
+        
         self.train()
+
+        metrics_dict["num_rays"] = (camera.height * camera.width * camera.size).item()
         return metrics_dict, images_dict
 
     @profiler.time_function
-    def get_average_eval_image_metrics(self):
+    def get_average_eval_image_metrics():
         """Iterate over all the images in the eval dataset and get the average.
 
         Args:
@@ -202,44 +219,8 @@ class ScafflodGSPipeline(Pipeline):
         """
         datamanager_params = self.datamanager.get_param_groups()
         model_params = self.model.get_param_groups()
+        
         # TODO(ethan): assert that key names don't overlap
         return {**datamanager_params, **model_params}
     
-
-
-# class SDFGSPipeline(Pipeline):
-
-
-#     def __init__(
-#         self,
-#         config: SDFGSPipelineConfig,
-#         device: str,
-#         test_mode: Literal["test", "val", "inference"] = "val",
-#         world_size: int = 1,
-#         local_rank: int = 0,
-#         grad_scaler: Optional[GradScaler] = None,
-#     ):
-#         super(VanillaPipeline, self).__init__()
-#         self.config = config
-#         self.test_mode = test_mode
-#         self.datamanager: DataManager = config.datamanager.setup(
-#             device=device, test_mode=test_mode, world_size=world_size, local_rank=local_rank
-#         )
-#         self.datamanager.to(device)
-
-#         assert self.datamanager.train_dataset is not None, "Missing input dataset"
-#         self._model = config.model.setup(
-#             scene_box=self.datamanager.train_dataset.scene_box,
-#             num_train_data=len(self.datamanager.train_dataset),
-#             metadata=self.datamanager.train_dataset.metadata,
-#             device=device,
-#             grad_scaler=grad_scaler,
-#         )
-#         self.model.to(device)
-
-#         self.world_size = world_size
-#         if world_size > 1:
-#             self._model = typing.cast(
-#                 SDFGSModel, DDP(self._model, device_ids=[local_rank], find_unused_parameters=True)
-#             )
-#             dist.barrier(device_ids=[local_rank])
+        
