@@ -282,3 +282,83 @@ class NeuSAccSampler(Sampler):
             # save_points("second.ply", ray_samples.frustums.get_start_positions().cpu().numpy().reshape(-1, 3))
         # self._update_counter += 1
         return ray_samples, ray_indices
+    
+
+class ScaffoldGSNeusSampler(NeuSSampler):
+    def __init__(
+        self,
+        num_samples: int = 64,
+        num_samples_importance: int = 64,
+        num_samples_outside: int = 32,
+        num_upsample_steps: int = 4,
+        base_variance: float = 64,
+        single_jitter: bool = True,
+    ) -> None:
+        super().__init__(
+            num_samples,
+            num_samples_importance,
+            num_samples_outside,
+            num_upsample_steps,
+            base_variance,
+            single_jitter
+        )
+    
+    def generate_ray_samples(
+        self,
+        ray_bundle: Optional[RayBundle] = None,
+        sdf_fn: Optional[Callable[[RaySamples, Callable], torch.Tensor]] = None,
+        encoding_fn: Optional[Callable] = None,
+        ray_samples: Optional[RaySamples] = None,
+    ) -> Union[Tuple[RaySamples, torch.Tensor], RaySamples]:
+        assert ray_bundle is not None
+        assert sdf_fn is not None
+        assert encoding_fn is not None
+
+        # Start with uniform sampling
+        if ray_samples is None:
+            ray_samples = self.uniform_sampler(ray_bundle, num_samples=self.num_samples)
+        assert ray_samples is not None
+
+        # print ("input raybundle", ray_bundle.shape)
+        # print ("raysamples", ray_samples.shape)
+        # input()
+
+        total_iters = 0
+        sorted_index = None
+        sdf: Optional[torch.Tensor] = None
+        new_samples = ray_samples
+
+        base_variance = self.base_variance
+
+        while total_iters < self.num_upsample_steps:
+            with torch.no_grad():
+                new_sdf = sdf_fn(new_samples, encoding_fn)
+
+            # merge sdf predictions
+            if sorted_index is not None:
+                assert sdf is not None
+                sdf_merge = torch.cat([sdf.squeeze(-1), new_sdf.squeeze(-1)], -1)
+                sdf = torch.gather(sdf_merge, 1, sorted_index).unsqueeze(-1)
+            else:
+                sdf = new_sdf
+
+            # compute with fix variances
+            alphas = self.rendering_sdf_with_fixed_inv_s(
+                ray_samples, sdf.reshape(ray_samples.shape), inv_s=base_variance * 2**total_iters
+            )
+
+            weights = ray_samples.get_weights_and_transmittance_from_alphas(alphas[..., None], weights_only=True)
+            weights = torch.cat((weights, torch.zeros_like(weights[:, :1])), dim=1)
+
+            new_samples = self.pdf_sampler(
+                ray_bundle,
+                ray_samples,
+                weights,
+                num_samples=self.num_samples_importance // self.num_upsample_steps,
+            )
+
+            ray_samples, sorted_index = self.merge_ray_samples(ray_bundle, ray_samples, new_samples)
+
+            total_iters += 1
+
+        return ray_samples

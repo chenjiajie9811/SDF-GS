@@ -19,6 +19,7 @@ import torch.nn.functional as F
 from dataclasses import dataclass, field
 from typing import Type, Literal, Tuple, Union, Dict, List, cast, Optional
 from jaxtyping import Float
+from collections import defaultdict
 
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func
 from torch import nn
@@ -38,9 +39,11 @@ from nerfstudio.cameras.cameras import Cameras
 from nerfstudio.engine.callbacks import TrainingCallback, TrainingCallbackAttributes, TrainingCallbackLocation
 from nerfstudio.field_components.encodings import NeRFEncoding, TriplaneEncoding, TensorVMEncoding, HashEncoding
 from nerfstudio.data.scene_box import SceneBox
+from nerfstudio.model_components.scene_colliders import AABBBoxCollider
 from nerfstudio.fields.sdf_field import LearnedVariance
 from nerfstudio.field_components.field_heads import FieldHeadNames
 from nerfstudio.model_components.ray_samplers import NeuSSampler
+from nerfstudio.utils import colormaps
 
 from nerfstudio.model_components.losses import L1Loss, MSELoss
 from pytorch_msssim import SSIM
@@ -49,6 +52,8 @@ from torchmetrics.image import PeakSignalNoiseRatio
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
 from nerfstudio.model_components.renderers import AccumulationRenderer, DepthRenderer, RGBRenderer, SemanticRenderer
+
+from sdfgs.sdfgs_samplers import ScaffoldGSNeusSampler
 
 import tinycudann as tcnn
 
@@ -315,8 +320,6 @@ class ScaffoldGSNeusField(nn.Module):
         """compute output of ray samples"""
         outputs = {}
 
-        camera_indices = ray_samples.camera_indices.squeeze()
-
         inputs = ray_samples.frustums.get_start_positions()
         inputs = inputs.view(-1, 3)
 
@@ -332,7 +335,7 @@ class ScaffoldGSNeusField(nn.Module):
             outputs=sdf, inputs=inputs, grad_outputs=d_output, create_graph=True, retain_graph=True, only_inputs=True
         )[0]
 
-        rgb = self.get_colors(inputs, directions_flat, gradients, geo_feature, camera_indices)
+        rgb = self.get_colors(inputs, directions_flat, gradients, geo_feature)
 
         rgb = rgb.view(*ray_samples.frustums.directions.shape[:-1], -1)
         sdf = sdf.view(*ray_samples.frustums.directions.shape[:-1], -1)
@@ -349,7 +352,7 @@ class ScaffoldGSNeusField(nn.Module):
         )
 
         if return_alphas:
-            alphas = self.get_alpha(ray_samples, sdf, gradients)
+            alphas = self.get_alpha(ray_samples, encoding, sdf, gradients)
             outputs.update({FieldHeadNames.ALPHA: alphas})
 
         return outputs
@@ -373,9 +376,9 @@ class ScaffoldGSNeusField(nn.Module):
 
 
 @dataclass
-class ScaffoldGaussianModelConfig(ModelConfig):
+class ScaffoldGaussianNeuSModelConfig(ModelConfig):
 
-    _target: Type = field(default_factory=lambda: ScaffoldGaussianModel)
+    _target: Type = field(default_factory=lambda: ScaffoldGaussianNeuSModel)
 
     sh_degree: int = 1
     """maximum degree of spherical harmonics to use"""
@@ -463,9 +466,9 @@ class ScaffoldGaussianModelConfig(ModelConfig):
     
 
     
-class ScaffoldGaussianModel(Model):
+class ScaffoldGaussianNeuSModel(Model):
 
-    config: ScaffoldGaussianModelConfig
+    config: ScaffoldGaussianNeuSModelConfig
 
     def setup_functions(self):
         def build_covariance_from_scaling_rotation(scaling, scaling_modifier, rotation):
@@ -503,7 +506,7 @@ class ScaffoldGaussianModel(Model):
 
         self._anchor = torch.empty(0)
         self._offset = torch.empty(0)
-        self._anchor_feat = torch.empty(0)
+        # self._anchor_feat = torch.empty(0)
         
         self.opacity_accum = torch.empty(0)
 
@@ -617,7 +620,7 @@ class ScaffoldGaussianModel(Model):
 
         # Neus field
         self.neus = ScaffoldGSNeusField(self.config.neus_config)
-        self.neus_sampler = NeuSSampler(
+        self.neus_sampler = ScaffoldGSNeusSampler(
             num_samples=self.config.num_samples,
             num_samples_importance=self.config.num_samples_importance,
             num_samples_outside=self.config.num_samples_outside,
@@ -626,6 +629,9 @@ class ScaffoldGaussianModel(Model):
         )
 
         self.field_background = nn.Parameter(torch.ones(1), requires_grad=False)
+
+        # Collider
+        self.collider = AABBBoxCollider(self.scene_box, near_plane=0.05)
 
         self.renderer_rgb = RGBRenderer(background_color="white" if self.config.white_background else "black")
         self.renderer_accumulation = AccumulationRenderer()
@@ -636,6 +642,8 @@ class ScaffoldGaussianModel(Model):
         self.eikonal_loss = MSELoss()
 
         self.anneal_end = 50000
+
+        self.gs_initialized = True
 
 
 
@@ -780,7 +788,7 @@ class ScaffoldGaussianModel(Model):
 
         self._anchor = nn.Parameter(fused_point_cloud.requires_grad_(True))
         self._offset = nn.Parameter(offsets.requires_grad_(True))
-        self._anchor_feat = nn.Parameter(anchors_feat.requires_grad_(True))
+        # self._anchor_feat = nn.Parameter(anchors_feat.requires_grad_(True))
         self._scaling = nn.Parameter(scales.requires_grad_(True))
         self._rotation = nn.Parameter(rots.requires_grad_(False))
         self._opacity = nn.Parameter(opacities.requires_grad_(False))
@@ -803,10 +811,11 @@ class ScaffoldGaussianModel(Model):
         Returns:
             Mapping of different parameter groups
         """
+
         params = {
             "anchor" : [self._anchor],
             "offset": [self._offset],
-            "anchor_feat": [self._anchor_feat],
+            # "anchor_feat": [self._anchor_feat],
             "opacity": [self._opacity],
             "scaling": [self._scaling],
             "rotation": [self._rotation],
@@ -815,14 +824,20 @@ class ScaffoldGaussianModel(Model):
             "mlp_opacity" : self.mlp_opacity.parameters(),
             "mlp_cov" : self.mlp_cov.parameters(),
             "mlp_color" : self.mlp_color.parameters(),
-
-            "neus" : self.neus.parameters(),
-            "neus_background" : [self.field_background]
         }
         if self.use_feat_bank:
             params.update({"mlp_featurebank" : self.mlp_feature_bank.parameters()})
 
-        return params
+        if not self.gs_initialized:
+            return params
+        else:
+            params.update(
+                {
+                    "neus" : self.neus.parameters(),
+                    "neus_background" : [self.field_background]
+                }
+            )
+            return params
             
         
    
@@ -830,8 +845,8 @@ class ScaffoldGaussianModel(Model):
         l = ['x', 'y', 'z', 'nx', 'ny', 'nz']
         for i in range(self._offset.shape[1]*self._offset.shape[2]):
             l.append('f_offset_{}'.format(i))
-        for i in range(self._anchor_feat.shape[1]):
-            l.append('f_anchor_feat_{}'.format(i))
+        # for i in range(self._anchor_feat.shape[1]):
+        #     l.append('f_anchor_feat_{}'.format(i))
         l.append('opacity')
         for i in range(self._scaling.shape[1]):
             l.append('scale_{}'.format(i))
@@ -844,7 +859,7 @@ class ScaffoldGaussianModel(Model):
 
         anchor = self._anchor.detach().cpu().numpy()
         normals = np.zeros_like(anchor)
-        anchor_feat = self._anchor_feat.detach().cpu().numpy()
+        # anchor_feat = self._anchor_feat.detach().cpu().numpy()
         offset = self._offset.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
         opacities = self._opacity.detach().cpu().numpy()
         scale = self._scaling.detach().cpu().numpy()
@@ -853,7 +868,8 @@ class ScaffoldGaussianModel(Model):
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
 
         elements = np.empty(anchor.shape[0], dtype=dtype_full)
-        attributes = np.concatenate((anchor, normals, offset, anchor_feat, opacities, scale, rotation), axis=1)
+        attributes = np.concatenate((anchor, normals, offset, opacities, scale, rotation), axis=1)
+        # attributes = np.concatenate((anchor, normals, offset, anchor_feat, opacities, scale, rotation), axis=1)
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
@@ -879,11 +895,11 @@ class ScaffoldGaussianModel(Model):
             rots[:, idx] = np.asarray(plydata.elements[0][attr_name]).astype(np.float32)
         
         # anchor_feat
-        anchor_feat_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("f_anchor_feat")]
-        anchor_feat_names = sorted(anchor_feat_names, key = lambda x: int(x.split('_')[-1]))
-        anchor_feats = np.zeros((anchor.shape[0], len(anchor_feat_names)))
-        for idx, attr_name in enumerate(anchor_feat_names):
-            anchor_feats[:, idx] = np.asarray(plydata.elements[0][attr_name]).astype(np.float32)
+        # anchor_feat_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("f_anchor_feat")]
+        # anchor_feat_names = sorted(anchor_feat_names, key = lambda x: int(x.split('_')[-1]))
+        # anchor_feats = np.zeros((anchor.shape[0], len(anchor_feat_names)))
+        # for idx, attr_name in enumerate(anchor_feat_names):
+        #     anchor_feats[:, idx] = np.asarray(plydata.elements[0][attr_name]).astype(np.float32)
 
         offset_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("f_offset")]
         offset_names = sorted(offset_names, key = lambda x: int(x.split('_')[-1]))
@@ -892,7 +908,7 @@ class ScaffoldGaussianModel(Model):
             offsets[:, idx] = np.asarray(plydata.elements[0][attr_name]).astype(np.float32)
         offsets = offsets.reshape((offsets.shape[0], 3, -1))
         
-        self._anchor_feat = nn.Parameter(torch.tensor(anchor_feats, dtype=torch.float, device="cuda").requires_grad_(True))
+        # self._anchor_feat = nn.Parameter(torch.tensor(anchor_feats, dtype=torch.float, device="cuda").requires_grad_(True))
 
         self._offset = nn.Parameter(torch.tensor(offsets, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
         self._anchor = nn.Parameter(torch.tensor(anchor, dtype=torch.float, device="cuda").requires_grad_(True))
@@ -1032,7 +1048,7 @@ class ScaffoldGaussianModel(Model):
 
         self._anchor = optimizable_tensors["anchor"]
         self._offset = optimizable_tensors["offset"]
-        self._anchor_feat = optimizable_tensors["anchor_feat"]
+        # self._anchor_feat = optimizable_tensors["anchor_feat"]
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
@@ -1101,9 +1117,9 @@ class ScaffoldGaussianModel(Model):
 
                 new_opacities = inverse_sigmoid(0.1 * torch.ones((candidate_anchor.shape[0], 1), dtype=torch.float, device="cuda"))
 
-                new_feat = self._anchor_feat.unsqueeze(dim=1).repeat([1, self.n_offsets, 1]).view([-1, self.feat_dim])[candidate_mask]
+                # new_feat = self._anchor_feat.unsqueeze(dim=1).repeat([1, self.n_offsets, 1]).view([-1, self.feat_dim])[candidate_mask]
 
-                new_feat = scatter_max(new_feat, inverse_indices.unsqueeze(1).expand(-1, new_feat.size(1)), dim=0)[0][remove_duplicates]
+                # new_feat = scatter_max(new_feat, inverse_indices.unsqueeze(1).expand(-1, new_feat.size(1)), dim=0)[0][remove_duplicates]
 
                 new_offsets = torch.zeros_like(candidate_anchor).unsqueeze(dim=1).repeat([1,self.n_offsets,1]).float().cuda()
 
@@ -1111,7 +1127,7 @@ class ScaffoldGaussianModel(Model):
                     "anchor": candidate_anchor,
                     "scaling": new_scaling,
                     "rotation": new_rotation,
-                    "anchor_feat": new_feat,
+                    # "anchor_feat": new_feat,
                     "offset": new_offsets,
                     "opacity": new_opacities,
                 }
@@ -1132,7 +1148,7 @@ class ScaffoldGaussianModel(Model):
                 self._anchor = optimizable_tensors["anchor"]
                 self._scaling = optimizable_tensors["scaling"]
                 self._rotation = optimizable_tensors["rotation"]
-                self._anchor_feat = optimizable_tensors["anchor_feat"]
+                # self._anchor_feat = optimizable_tensors["anchor_feat"]
                 self._offset = optimizable_tensors["offset"]
                 self._opacity = optimizable_tensors["opacity"]
                 
@@ -1382,9 +1398,9 @@ class ScaffoldGaussianModel(Model):
         x = SceneBox.get_normalized_positions(x, self.aabb)
         return self.encoding(x)
     
-    def sample_and_forward_field(self, ray_bundle: RayBundle) -> Dict:
-        ray_samples : RaySamples = self.neus_sampler(ray_bundle, sdf_fn=self.neus.get_sdf)
-        field_outputs = self.neus(ray_samples, self.encoding, return_alphas=True)
+    def sample_and_forward_field(self, ray_bundle: RayBundle, encoding=None) -> Dict:
+        ray_samples : RaySamples = self.neus_sampler(ray_bundle, sdf_fn=self.neus.get_sdf, encoding_fn=encoding)
+        field_outputs = self.neus.forward(ray_samples, encoding, return_alphas=True)
         weights, transmittance = ray_samples.get_weights_and_transmittance_from_alphas(
             field_outputs[FieldHeadNames.ALPHA]
         )
@@ -1416,8 +1432,10 @@ class ScaffoldGaussianModel(Model):
             ray_bundle.metadata is not None and "directions_norm" in ray_bundle.metadata
         ), "directions_norm is required in ray_bundle.metadata"
 
-        
-        samples_and_field_outputs = self.sample_and_forward_field(ray_bundle=ray_bundle)
+        if self.collider is not None:
+            ray_bundle = self.collider(ray_bundle)
+
+        samples_and_field_outputs = self.sample_and_forward_field(ray_bundle=ray_bundle, encoding=self.encoding.forward)
 
         # shortcuts
         field_outputs: Dict[FieldHeadNames, torch.Tensor] = cast(
@@ -1498,7 +1516,7 @@ class ScaffoldGaussianModel(Model):
     def get_loss_dict_gs(self, outputs, batch) -> Dict[str, torch.Tensor]:
         gt_img = batch["image"].to(self.device)
         Ll1 = torch.abs(gt_img - outputs["rgb_gs"]).mean()
-        simloss = 1 - self.ssim(gt_img.permute(2, 0, 1)[None, ...], outputs["rgb"].permute(2, 0, 1)[None, ...])
+        simloss = 1 - self.ssim(gt_img.permute(2, 0, 1)[None, ...], outputs["rgb_gs"].permute(2, 0, 1)[None, ...])
         
         return {
             "loss_gs": (1 - self.config.ssim_lambda) * Ll1 + self.config.ssim_lambda * simloss,
@@ -1545,15 +1563,48 @@ class ScaffoldGaussianModel(Model):
             camera: generates raybundle
         """
         assert camera is not None, "must provide camera to gaussian model"
-        ray_bundle =  self.get_outputs_for_camera_ray_bundle(
+        outputs_neus =  self.get_outputs_for_camera_ray_bundle(
             camera.generate_rays(camera_indices=0, keep_shape=True, obb_box=obb_box)
         )
         
-        outs = self.get_outputs(camera.to(self.device), ray_bundle)
-        return outs  # type: ignore
+        outputs_gs = self.get_outputs_gs(camera.to(self.device))
+        return {**outputs_neus, **outputs_gs} # type: ignore
+    
+    @torch.no_grad()
+    def get_outputs_for_camera_ray_bundle(self, camera_ray_bundle: RayBundle) -> Dict[str, torch.Tensor]:
+        """Takes in camera parameters and computes the output of the model.
+
+        Args:
+            camera_ray_bundle: ray bundle to calculate outputs over
+        """
+        input_device = camera_ray_bundle.directions.device
+        num_rays_per_chunk = self.config.eval_num_rays_per_chunk
+        image_height, image_width = camera_ray_bundle.origins.shape[:2]
+        num_rays = len(camera_ray_bundle)
+        outputs_lists = defaultdict(list)
+        for i in range(0, num_rays, num_rays_per_chunk):
+            start_idx = i
+            end_idx = i + num_rays_per_chunk
+            ray_bundle = camera_ray_bundle.get_row_major_sliced_ray_bundle(start_idx, end_idx)
+            # move the chunk inputs to the model device
+            ray_bundle = ray_bundle.to(self.device)
+            outputs = self.get_outputs_neus(ray_bundle=ray_bundle)
+            for output_name, output in outputs.items():  # type: ignore
+                if not isinstance(output, torch.Tensor):
+                    # TODO: handle lists of tensors as well
+                    continue
+                # move the chunk outputs from the model device back to the device of the inputs.
+                outputs_lists[output_name].append(output.to(input_device))
+        outputs = {}
+        for output_name, outputs_list in outputs_lists.items():
+            outputs[output_name] = torch.cat(outputs_list).view(image_height, image_width, -1)  # type: ignore
+        return outputs
     
     def get_image_metrics_and_images(
-        self, outputs: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor]
+        self, 
+        outputs: Dict[str, torch.Tensor], 
+        batch: Dict[str, torch.Tensor],
+        with_neus: bool = False
     ) -> Tuple[Dict[str, float], Dict[str, torch.Tensor]]:
 
         
@@ -1561,38 +1612,93 @@ class ScaffoldGaussianModel(Model):
         gt_rgb = gt_img.to(self.device)
 
         predicted_rgb_gs = outputs["rgb_gs"]
-        predicted_rgb_neus = outputs["rgb_neus"]
 
         combined_rgb_gs = torch.cat([gt_rgb, predicted_rgb_gs], dim=1)
-        combined_rgb_neus = torch.cat([gt_rgb, predicted_rgb_neus], dim=1)
-
+        
         # Switch images from [H, W, C] to [1, C, H, W] for metrics computations
+        gt_rgb_m = torch.moveaxis(gt_rgb, -1, 0)[None, ...]
+        predicted_rgb_gs = torch.moveaxis(predicted_rgb_gs, -1, 0)[None, ...]
+        
+        psnr_gs = self.psnr(gt_rgb_m, predicted_rgb_gs)
+        ssim_gs = self.ssim(gt_rgb_m, predicted_rgb_gs)
+        lpips_gs = self.lpips(gt_rgb_m, predicted_rgb_gs)
 
-        gt_rgb = torch.moveaxis(gt_rgb, -1, 0)[None, ...]
-        combined_rgb_gs = torch.moveaxis(combined_rgb_gs, -1, 0)[None, ...]
-        combined_rgb_neus = torch.moveaxis(combined_rgb_neus, -1, 0)[None, ...]
-
-        psnr_gs = self.psnr(gt_rgb, combined_rgb_gs)
-        ssim_gs = self.ssim(gt_rgb, combined_rgb_gs)
-        lpips_gs = self.lpips(gt_rgb, combined_rgb_gs)
-
-        psnr_neus = self.psnr(gt_rgb, combined_rgb_neus)
-        ssim_neus = self.ssim(gt_rgb, combined_rgb_neus)
-        lpips_neus = self.lpips(gt_rgb, combined_rgb_neus)
-
-        # all of these metrics will be logged as scalars
         metrics_dict = {
             "psnr_gs": float(psnr_gs.item()), 
             "ssim_gs": float(ssim_gs.item()),
             "lpips_gs": float(lpips_gs.item()),
-            "psnr_neus": float(psnr_neus.item()), 
-            "ssim_neus": float(ssim_neus.item()),
-            "lpips_neus": float(lpips_neus.item()),}  # type: ignore
+            }
+        
+        images_dict = {"img_gs": combined_rgb_gs,}
+    
+        if with_neus:
+            predicted_rgb_neus = outputs["rgb_neus"]
+            combined_rgb_neus = torch.cat([gt_rgb, predicted_rgb_neus], dim=1)
+
+            predicted_rgb_neus = torch.moveaxis(predicted_rgb_neus, -1, 0)[None, ...]
+            psnr_neus = self.psnr(gt_rgb_m, predicted_rgb_neus)
+            ssim_neus = self.ssim(gt_rgb_m, predicted_rgb_neus)
+            lpips_neus = self.lpips(gt_rgb_m, predicted_rgb_neus)
 
 
-        images_dict = {"img_gs": combined_rgb_gs, "img_neus": combined_rgb_neus}
+            metrics_dict["psnr_neus"] = float(psnr_neus.item())
+            metrics_dict["ssim_neus"] = float(ssim_neus.item())
+            metrics_dict["lpips_neus"] = float(lpips_neus.item())
+
+        
+            acc = colormaps.apply_colormap(outputs["accumulation"])
+            combined_acc = torch.cat([acc], dim=1)
+
+            depth = colormaps.apply_depth_colormap(
+                    outputs["depth"],
+                    accumulation=outputs["accumulation"],
+                )
+            combined_depth = torch.cat([depth], dim=1)
+
+            normal = outputs["normal"]
+            normal = (normal + 1.0) / 2.0
+            combined_normal = torch.cat([normal], dim=1)
+
+            images_dict_neus = {
+                "img_neus": combined_rgb_neus,
+                "accumulation": combined_acc,
+                "depth": combined_depth,
+                "normal": combined_normal,}
+            
+            images_dict.update(**images_dict_neus)
+            
+        
 
         return metrics_dict, images_dict
+    
+def extract_fields(bound_min, bound_max, resolution, query_func):
+    N = 64
+    X = torch.linspace(bound_min[0], bound_max[0], resolution, device='cuda').split(N)
+    Y = torch.linspace(bound_min[1], bound_max[1], resolution, device='cuda').split(N)
+    Z = torch.linspace(bound_min[2], bound_max[2], resolution, device='cuda').split(N)
+
+    u = np.zeros([resolution, resolution, resolution], dtype=np.float32)
+    with torch.no_grad():
+        for xi, xs in enumerate(X):
+            for yi, ys in enumerate(Y):
+                for zi, zs in enumerate(Z):
+                    xx, yy, zz = torch.meshgrid(xs, ys, zs)
+                    pts = torch.cat([xx.reshape(-1, 1), yy.reshape(-1, 1), zz.reshape(-1, 1)], dim=-1)
+                    val = query_func(pts).reshape(len(xs), len(ys), len(zs)).detach().cpu().numpy()
+                    u[xi * N: xi * N + len(xs), yi * N: yi * N + len(ys), zi * N: zi * N + len(zs)] = val
+    return u
+
+
+def extract_geometry(bound_min, bound_max, resolution, threshold, query_func):
+    import mcubes
+    print('threshold: {}'.format(threshold))
+    u = extract_fields(bound_min, bound_max, resolution, query_func)
+    vertices, triangles = mcubes.marching_cubes(u, threshold)
+    b_max_np = bound_max#.detach().cpu().numpy()
+    b_min_np = bound_min#.detach().cpu().numpy()
+
+    vertices = vertices / (resolution - 1.0) * (b_max_np - b_min_np)[None, :] + b_min_np[None, :]
+    return vertices, triangles
 
 
 

@@ -155,7 +155,7 @@ class ScaffoldGaussianModel(Model):
 
         self._anchor = torch.empty(0)
         self._offset = torch.empty(0)
-        self._anchor_feat = torch.empty(0)
+        # self._anchor_feat = torch.empty(0)
         
         self.opacity_accum = torch.empty(0)
 
@@ -407,7 +407,7 @@ class ScaffoldGaussianModel(Model):
 
         self._anchor = nn.Parameter(fused_point_cloud.requires_grad_(True))
         self._offset = nn.Parameter(offsets.requires_grad_(True))
-        self._anchor_feat = nn.Parameter(anchors_feat.requires_grad_(True))
+        # self._anchor_feat = nn.Parameter(anchors_feat.requires_grad_(True))
         self._scaling = nn.Parameter(scales.requires_grad_(True))
         self._rotation = nn.Parameter(rots.requires_grad_(False))
         self._opacity = nn.Parameter(opacities.requires_grad_(False))
@@ -433,7 +433,7 @@ class ScaffoldGaussianModel(Model):
         params = {
             "anchor" : [self._anchor],
             "offset": [self._offset],
-            "anchor_feat": [self._anchor_feat],
+            # "anchor_feat": [self._anchor_feat],
             "opacity": [self._opacity],
             "scaling": [self._scaling],
             "rotation": [self._rotation],
@@ -454,8 +454,8 @@ class ScaffoldGaussianModel(Model):
         l = ['x', 'y', 'z', 'nx', 'ny', 'nz']
         for i in range(self._offset.shape[1]*self._offset.shape[2]):
             l.append('f_offset_{}'.format(i))
-        for i in range(self._anchor_feat.shape[1]):
-            l.append('f_anchor_feat_{}'.format(i))
+        # for i in range(self._anchor_feat.shape[1]):
+        #     l.append('f_anchor_feat_{}'.format(i))
         l.append('opacity')
         for i in range(self._scaling.shape[1]):
             l.append('scale_{}'.format(i))
@@ -468,7 +468,7 @@ class ScaffoldGaussianModel(Model):
 
         anchor = self._anchor.detach().cpu().numpy()
         normals = np.zeros_like(anchor)
-        anchor_feat = self._anchor_feat.detach().cpu().numpy()
+        # anchor_feat = self._anchor_feat.detach().cpu().numpy()
         offset = self._offset.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
         opacities = self._opacity.detach().cpu().numpy()
         scale = self._scaling.detach().cpu().numpy()
@@ -477,7 +477,8 @@ class ScaffoldGaussianModel(Model):
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
 
         elements = np.empty(anchor.shape[0], dtype=dtype_full)
-        attributes = np.concatenate((anchor, normals, offset, anchor_feat, opacities, scale, rotation), axis=1)
+        attributes = np.concatenate((anchor, normals, offset, opacities, scale, rotation), axis=1)
+        # attributes = np.concatenate((anchor, normals, offset, anchor_feat, opacities, scale, rotation), axis=1)
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
@@ -503,11 +504,11 @@ class ScaffoldGaussianModel(Model):
             rots[:, idx] = np.asarray(plydata.elements[0][attr_name]).astype(np.float32)
         
         # anchor_feat
-        anchor_feat_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("f_anchor_feat")]
-        anchor_feat_names = sorted(anchor_feat_names, key = lambda x: int(x.split('_')[-1]))
-        anchor_feats = np.zeros((anchor.shape[0], len(anchor_feat_names)))
-        for idx, attr_name in enumerate(anchor_feat_names):
-            anchor_feats[:, idx] = np.asarray(plydata.elements[0][attr_name]).astype(np.float32)
+        # anchor_feat_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("f_anchor_feat")]
+        # anchor_feat_names = sorted(anchor_feat_names, key = lambda x: int(x.split('_')[-1]))
+        # anchor_feats = np.zeros((anchor.shape[0], len(anchor_feat_names)))
+        # for idx, attr_name in enumerate(anchor_feat_names):
+        #     anchor_feats[:, idx] = np.asarray(plydata.elements[0][attr_name]).astype(np.float32)
 
         offset_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("f_offset")]
         offset_names = sorted(offset_names, key = lambda x: int(x.split('_')[-1]))
@@ -516,7 +517,7 @@ class ScaffoldGaussianModel(Model):
             offsets[:, idx] = np.asarray(plydata.elements[0][attr_name]).astype(np.float32)
         offsets = offsets.reshape((offsets.shape[0], 3, -1))
         
-        self._anchor_feat = nn.Parameter(torch.tensor(anchor_feats, dtype=torch.float, device="cuda").requires_grad_(True))
+        # self._anchor_feat = nn.Parameter(torch.tensor(anchor_feats, dtype=torch.float, device="cuda").requires_grad_(True))
 
         self._offset = nn.Parameter(torch.tensor(offsets, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
         self._anchor = nn.Parameter(torch.tensor(anchor, dtype=torch.float, device="cuda").requires_grad_(True))
@@ -654,7 +655,7 @@ class ScaffoldGaussianModel(Model):
 
         self._anchor = optimizable_tensors["anchor"]
         self._offset = optimizable_tensors["offset"]
-        self._anchor_feat = optimizable_tensors["anchor_feat"]
+        # self._anchor_feat = optimizable_tensors["anchor_feat"]
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
@@ -723,9 +724,9 @@ class ScaffoldGaussianModel(Model):
 
                 new_opacities = inverse_sigmoid(0.1 * torch.ones((candidate_anchor.shape[0], 1), dtype=torch.float, device="cuda"))
 
-                new_feat = self._anchor_feat.unsqueeze(dim=1).repeat([1, self.n_offsets, 1]).view([-1, self.feat_dim])[candidate_mask]
+                # new_feat = self._anchor_feat.unsqueeze(dim=1).repeat([1, self.n_offsets, 1]).view([-1, self.feat_dim])[candidate_mask]
 
-                new_feat = scatter_max(new_feat, inverse_indices.unsqueeze(1).expand(-1, new_feat.size(1)), dim=0)[0][remove_duplicates]
+                # new_feat = scatter_max(new_feat, inverse_indices.unsqueeze(1).expand(-1, new_feat.size(1)), dim=0)[0][remove_duplicates]
 
                 new_offsets = torch.zeros_like(candidate_anchor).unsqueeze(dim=1).repeat([1,self.n_offsets,1]).float().cuda()
 
@@ -733,7 +734,7 @@ class ScaffoldGaussianModel(Model):
                     "anchor": candidate_anchor,
                     "scaling": new_scaling,
                     "rotation": new_rotation,
-                    "anchor_feat": new_feat,
+                    # "anchor_feat": new_feat,
                     "offset": new_offsets,
                     "opacity": new_opacities,
                 }
@@ -754,7 +755,7 @@ class ScaffoldGaussianModel(Model):
                 self._anchor = optimizable_tensors["anchor"]
                 self._scaling = optimizable_tensors["scaling"]
                 self._rotation = optimizable_tensors["rotation"]
-                self._anchor_feat = optimizable_tensors["anchor_feat"]
+                # self._anchor_feat = optimizable_tensors["anchor_feat"]
                 self._offset = optimizable_tensors["offset"]
                 self._opacity = optimizable_tensors["opacity"]
                 

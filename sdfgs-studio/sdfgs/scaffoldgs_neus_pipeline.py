@@ -13,13 +13,16 @@ from torch.cuda.amp.grad_scaler import GradScaler
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from sdfgs.sdfgs_datamanager import SDFGSDataManagerConfig
-from sdfgs.scaffoldgs_neus_model import ScaffoldGaussianModel, ScaffoldGaussianModelConfig
+from sdfgs.scaffoldgs_neus_model import ScaffoldGaussianNeuSModel, ScaffoldGaussianNeuSModelConfig
 from nerfstudio.data.datamanagers.base_datamanager import (
     DataManager,
     DataManagerConfig,
+    VanillaDataManager,
+    VanillaDataManagerConfig
 )
+from nerfstudio.data.datamanagers.full_images_datamanager import FullImageDatamanager, FullImageDatamanagerConfig
 from nerfstudio.models.base_model import ModelConfig
-from nerfstudio.engine.callbacks import TrainingCallback, TrainingCallbackAttributes
+from nerfstudio.engine.callbacks import TrainingCallback, TrainingCallbackAttributes, TrainingCallbackLocation
 from nerfstudio.pipelines.base_pipeline import (
     Pipeline,
     VanillaPipeline,
@@ -27,6 +30,12 @@ from nerfstudio.pipelines.base_pipeline import (
     module_wrapper
 )
 from nerfstudio.data.dataparsers.colmap_dataparser import ColmapDataParserConfig
+
+from nerfstudio.engine.optimizers import AdamOptimizerConfig, RAdamOptimizerConfig
+from nerfstudio.engine.schedulers import (
+    ExponentialDecaySchedulerConfig,
+    CosineDecaySchedulerConfig
+)
 
 from nerfstudio.utils import profiler
 
@@ -36,12 +45,12 @@ from utils.graphics_utils import BasicPointCloud
 
 
 @dataclass
-class SDFGSPipelineConfig(VanillaPipelineConfig):
+class ScaffoldGSNeuSPipelineConfig(VanillaPipelineConfig):
     """Configuration for pipeline instantiation"""
 
-    _target: Type = field(default_factory=lambda: SDFGSPipeline)
+    _target: Type = field(default_factory=lambda: ScaffoldGSNeuSPipeline)
     """target class to instantiate"""
-    datamanager: DataManagerConfig = SDFGSDataManagerConfig(
+    datamanager: DataManagerConfig = FullImageDatamanagerConfig(
         dataparser=ColmapDataParserConfig(
                         data=Path('/usr/stud/chj/storage/user/chj/datasets/db/playroom'),
                         colmap_path=Path("sparse/0"),
@@ -49,21 +58,27 @@ class SDFGSPipelineConfig(VanillaPipelineConfig):
                         load_3D_points=True,
                     ),
     )
+    datamanager_neus: DataManagerConfig = VanillaDataManagerConfig(
+        dataparser=ColmapDataParserConfig(
+                        data=Path('/usr/stud/chj/storage/user/chj/datasets/db/playroom'),
+                        colmap_path=Path("sparse/0"),
+                        scale_factor=0.7, # try to make all the scene inside the -1, 1 box
+                        load_3D_points=False,
+                    ),
+    )
     """specifies the datamanager config"""
-    model: ScaffoldGaussianModelConfig = ScaffoldGaussianModelConfig()
+    model: ScaffoldGaussianNeuSModelConfig = ScaffoldGaussianNeuSModelConfig()
     """specifies the gs model config"""
-    steps_sdf_init: int = 250
+    steps_gs_init: int = 0
     """steps to run volume rendering alone for initialization"""
-    interval_reset_mesh: int = 250
-    """interval to run marching cubes from the sdf field"""
 
 
-class SDFGSPipeline(Pipeline):
+class ScaffoldGSNeuSPipeline(Pipeline):
 
 
     def __init__(
         self,
-        config: SDFGSPipelineConfig,
+        config: ScaffoldGSNeuSPipelineConfig,
         device: str,
         test_mode: Literal["test", "val", "inference"] = "val",
         world_size: int = 1,
@@ -87,10 +102,15 @@ class SDFGSPipeline(Pipeline):
 
         self.datamanager.to(device)
 
+        self.datamanager_neus: DataManager = config.datamanager_neus.setup(
+           device=device, test_mode=test_mode, world_size=world_size, local_rank=local_rank
+        )
+        self.datamanager_neus.to(device)
+
         assert self.datamanager.train_dataset is not None, "Missing input dataset"
 
         # model
-        self._model : ScaffoldGaussianModel = config.model.setup(
+        self._model : ScaffoldGaussianNeuSModel = config.model.setup(
             scene_box=self.datamanager.train_dataset.scene_box,
             num_train_data=len(self.datamanager.train_dataset),
             metadata=self.datamanager.train_dataset.metadata,
@@ -115,7 +135,7 @@ class SDFGSPipeline(Pipeline):
         self.world_size = world_size
         if world_size > 1:
             self._model = typing.cast(
-                ScaffoldGaussianModel, DDP(self._model, device_ids=[local_rank], find_unused_parameters=True)
+                ScaffoldGaussianNeuSModel, DDP(self._model, device_ids=[local_rank], find_unused_parameters=True)
             )
             dist.barrier(device_ids=[local_rank])
 
@@ -136,11 +156,20 @@ class SDFGSPipeline(Pipeline):
         Args:
             step: current iteration step to update sampler if using DDP (distributed)
         """
-        ray_bundle, ray_batch, camera, cam_batch = self.datamanager.next_train(step)
+        # ray_bundle, ray_batch, camera, cam_batch = self.datamanager.next_train(step)
+        # camera, cam_batch = self.datamanager.next_train(step)
 
-        model_outputs = self._model.forward(camera, ray_bundle)  
-        metrics_dict = self._model.get_metrics_dict(model_outputs, cam_batch, ray_batch)
-        loss_dict = self._model.get_loss_dict(model_outputs, cam_batch, ray_batch)
+        if step < self.config.steps_gs_init:
+            camera, cam_batch = self.datamanager.next_train(step)
+            model_outputs = self._model.get_outputs_gs(camera)
+            metrics_dict = self._model.get_metrics_dict_gs(model_outputs, cam_batch)
+            loss_dict = self._model.get_loss_dict_gs(model_outputs, cam_batch)
+        else:
+            ray_bundle, ray_batch = self.datamanager_neus.next_train(step)
+            camera, cam_batch = self.datamanager.next_train(step)
+            model_outputs = self._model.forward(camera, ray_bundle)  
+            metrics_dict = self._model.get_metrics_dict(model_outputs, cam_batch, ray_batch)
+            loss_dict = self._model.get_loss_dict(model_outputs, cam_batch, ray_batch)
 
         return model_outputs, loss_dict, metrics_dict
     
@@ -161,10 +190,20 @@ class SDFGSPipeline(Pipeline):
         """
         self.eval()
 
-        ray_bundle, ray_batch, camera, cam_batch = self.datamanager.next_eval(step)
-        model_outputs = self._model.forward(camera, ray_bundle)  
-        metrics_dict = self._model.get_metrics_dict(model_outputs, cam_batch, ray_batch)
-        loss_dict = self._model.get_loss_dict(model_outputs, cam_batch, ray_batch)
+        # ray_bundle, ray_batch, camera, cam_batch = self.datamanager.next_train(step)
+        # camera, cam_batch = self.datamanager.next_train(step)
+
+        if step < self.config.steps_gs_init:
+            camera, cam_batch = self.datamanager.next_train(step)
+            model_outputs = self._model.get_outputs_gs(camera)
+            metrics_dict = self._model.get_metrics_dict_gs(model_outputs, cam_batch)
+            loss_dict = self._model.get_loss_dict_gs(model_outputs, cam_batch)
+        else:
+            ray_bundle, ray_batch = self.datamanager_neus.next_train(step)
+            camera, cam_batch = self.datamanager.next_train(step)
+            model_outputs = self._model.forward(camera, ray_bundle)  
+            metrics_dict = self._model.get_metrics_dict(model_outputs, cam_batch, ray_batch)
+            loss_dict = self._model.get_loss_dict(model_outputs, cam_batch, ray_batch)
 
         self.train()
 
@@ -180,8 +219,13 @@ class SDFGSPipeline(Pipeline):
         """
         self.eval()
         camera, batch = self.datamanager.next_eval_image(step)
-        model_outputs = self.model.get_outputs_for_camera(camera)  
-        metrics_dict, images_dict = self.model.get_image_metrics_and_images(model_outputs, batch)
+
+        if step < self.config.steps_gs_init:
+            model_outputs = self._model.get_outputs_gs(camera)
+            metrics_dict, images_dict = self._model.get_image_metrics_and_images(model_outputs, batch, with_neus=False)
+        else:
+            model_outputs = self.model.get_outputs_for_camera(camera)  
+            metrics_dict, images_dict = self._model.get_image_metrics_and_images(model_outputs, batch, with_neus=True)
         
         self.train()
 
@@ -202,6 +246,50 @@ class SDFGSPipeline(Pipeline):
         """
         raise NotImplementedError
     
+    def add_optimizer_after_init(
+            self, 
+            training_callback_attributes: TrainingCallbackAttributes, 
+            step: int):
+        assert training_callback_attributes.optimizers is not None
+        assert training_callback_attributes.pipeline is not None
+
+        if step != self.config.steps_gs_init:
+            return
+
+        new_parameter_groups = {}
+        all_params = self._model.get_param_groups()
+        new_parameter_groups["neus"] = all_params["neus"]
+        new_parameter_groups["neus_background"] = all_params["neus_background"]
+        
+        new_optimizers_config = {
+            "neus" : {
+                "optimizer": AdamOptimizerConfig(lr=5e-4, eps=1e-15),
+            "scheduler": CosineDecaySchedulerConfig(warm_up_end=5000, learning_rate_alpha=0.05, max_steps=300000),
+            },
+            "neus_background" : {
+                "optimizer": AdamOptimizerConfig(lr=5e-4, eps=1e-15),
+            "scheduler": CosineDecaySchedulerConfig(warm_up_end=5000, learning_rate_alpha=0.05, max_steps=300000),
+            },
+        }
+        
+        training_optimizers = training_callback_attributes.optimizers
+        for group_name, params in new_parameter_groups.items():
+
+            lr_init = new_optimizers_config[group_name]["optimizer"].lr
+            training_optimizers.optimizers[group_name] = new_optimizers_config[group_name]["optimizer"].setup(params=params)
+            training_optimizers.parameters[group_name] = params
+            
+            training_optimizers.schedulers[group_name] = (
+                    new_optimizers_config[group_name]["scheduler"]
+                    .setup()
+                    .get_scheduler(optimizer=training_optimizers.optimizers[group_name], lr_init=lr_init)
+                )
+    
+    def set_init_finished_flag(self, step:int):
+        if step != self.config.steps_gs_init:
+            return 
+        self._model.gs_initialized = True
+    
     def get_training_callbacks(
         self, training_callback_attributes: TrainingCallbackAttributes
     ) -> List[TrainingCallback]:
@@ -209,6 +297,23 @@ class SDFGSPipeline(Pipeline):
         datamanager_callbacks = self.datamanager.get_training_callbacks(training_callback_attributes)
         model_callbacks = self.model.get_training_callbacks(training_callback_attributes)
         callbacks = datamanager_callbacks + model_callbacks
+
+        # callbacks.append(
+        #     TrainingCallback(
+        #         [TrainingCallbackLocation.BEFORE_TRAIN_ITERATION],
+        #         iters=[self.config.steps_gs_init],
+        #         func=self.set_init_finished_flag,
+        #     )
+        # )
+        
+        # callbacks.append(
+        #     TrainingCallback(
+        #         [TrainingCallbackLocation.AFTER_TRAIN],
+        #         iters=[self.config.steps_gs_init],
+        #         func=self.add_optimizer_after_init,
+        #         args=[training_callback_attributes],
+        #     )
+        # )
         return callbacks
     
     def get_param_groups(self) -> Dict[str, List[Parameter]]:
